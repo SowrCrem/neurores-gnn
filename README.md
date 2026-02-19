@@ -39,12 +39,12 @@ This repository contains the generative Graph Neural Network (GNN) framework des
 
 3.  **Authenticate with Kaggle**:
 
-    Download your API token from [kaggle.com](https://www.kaggle.com) → **Settings → API → Create New Token**. This saves a `kaggle.json` file. On WSL, your Windows Downloads folder is at `/mnt/c/Users/<your-username>/Downloads/`:
+    Go to [kaggle.com](https://www.kaggle.com) → **Settings → API** and copy your API key. Then paste it into:
     ```bash
     mkdir -p ~/.kaggle
-    cp /mnt/c/Users/<your-username>/Downloads/kaggle.json ~/.kaggle/kaggle.json
-    chmod 600 ~/.kaggle/kaggle.json
+    nano ~/.kaggle/access_token
     ```
+    Paste your API key as plain text and save (`Ctrl+O`, `Enter`, `Ctrl+X`).
 
 4.  **Download competition data**:
     ```bash

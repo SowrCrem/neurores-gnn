@@ -1,6 +1,7 @@
 # Data and outputs
 data/
 submission/
+checkpoints/
 *.zip
 
 # Python

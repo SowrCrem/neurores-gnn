@@ -1,9 +1,7 @@
 # Base hyperparameter config for the Brain GNN super-resolution model
 
 data:
-  lr_train_path: data/train/lr/
-  hr_train_path: data/train/hr/
-  lr_test_path: data/public_test/lr/
+  data_dir: data/
   lr_nodes: 160       # ROIs in the low-resolution graph
   hr_nodes: 268       # ROIs in the high-resolution graph
 
@@ -19,5 +17,6 @@ training:
   scheduler: cosine   # cosine | step | none
 
 logging:
-  log_interval: 10    # log every N epochs
+  log_interval: 10    # print loss every N epochs
+  save_interval: 10   # write latest.pt and epoch_XXXX.pt every N epochs
   checkpoint_dir: checkpoints/

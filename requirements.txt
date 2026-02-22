@@ -1,7 +1,18 @@
-dgl
+# Core ML
 torch
+dgl
 numpy
+scipy
+
+# Data
 pandas
 scikit-learn
-pyyaml
 kaggle
+
+# Config & utils
+pyyaml
+tqdm
+psutil
+
+# Visualisation
+matplotlib

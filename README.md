@@ -30,7 +30,8 @@ neurores-gnn/
 ├── utils/
 │   ├── matrix_vectorizer.py     # ✅ MatrixVectorizer — column-wise vectorize / anti-vectorize
 │   ├── graph_utils.py           # ✅ Preprocessing, degree normalisation, adj ↔ DGL
-│   └── metrics.py               # 🔲 TODO: MAE, PCC, JSD, BC, EC, PC + 2 custom measures
+│   └── metrics.py               # ✅ Calculation of MAE, PCC, JSD, BC, EC, PC + 2 custom measures
+│   └── plotting.py              # ✅ Plotting of metrics into bar graphs
 │
 ├── notebooks/
 │   ├── devec_check.ipynb        # ✅ Devectorisation validation + correct vs wrong visualisations

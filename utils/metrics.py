@@ -12,8 +12,9 @@ This module also computes several secondary metrics:
         * PageRank Centrality (PC)
         * Eigenvector Centrality (EC)
         * Betweenness Centrality (BC)
-        * Node Strength (weighted degree)  [NEW]
-        * Weighted Clustering Coefficient   [NEW]
+    Additional geometric/topological measures (spec §II.A.a):
+        * Node Strength (weighted degree)
+        * Weighted Clustering Coefficient
 
 Notes:
     - Inputs are assumed to be non-negative (if not, we clamp negatives to 0).
@@ -28,6 +29,7 @@ import networkx as nx
 from sklearn.metrics import mean_absolute_error
 from scipy.stats import pearsonr
 from scipy.spatial.distance import jensenshannon
+from tqdm import tqdm
 
 from utils.matrix_vectorizer import MatrixVectorizer
 
@@ -38,7 +40,7 @@ from utils.matrix_vectorizer import MatrixVectorizer
 METRIC_ORDER = [
     "MAE", "PCC", "JSD",
     "MAE (PC)", "MAE (EC)", "MAE (BC)",
-    "MAE (Strength)", "MAE (Clustering)"
+    "MAE (Strength)", "MAE (Clustering)",
 ]
 
 
@@ -264,36 +266,29 @@ def evaluate_fold(
         "MAE (Clustering)": [],
     }
 
-    for i in range(pred_mats.shape[0]):
-        # Per-sample adjacency, optionally removing diagonal (self-loops)
+    n_samples = pred_mats.shape[0]
+    for i in tqdm(range(n_samples), desc="Graph metrics", disable=not verbose):
         p = _mask_diagonal(pred_mats[i]) if ignore_diagonal else pred_mats[i]
         g = _mask_diagonal(gt_mats[i]) if ignore_diagonal else gt_mats[i]
 
-        # Build weighted undirected graphs (nx.from_numpy_array -> Graph)
         Gp = nx.from_numpy_array(p, edge_attr="weight")
         Gg = nx.from_numpy_array(g, edge_attr="weight")
 
-        # PageRank centrality (weighted)
         pred_pc = nx.pagerank(Gp, weight="weight")
         gt_pc = nx.pagerank(Gg, weight="weight")
 
-        # Eigenvector centrality (weighted, robust computation)
         pred_ec = _safe_ec(Gp)
         gt_ec = _safe_ec(Gg)
 
-        # Betweenness centrality (weighted)
         pred_bc = nx.betweenness_centrality(Gp, weight="weight")
         gt_bc = nx.betweenness_centrality(Gg, weight="weight")
 
-        # NEW #1: Node strength = weighted degree
         pred_strength = dict(Gp.degree(weight="weight"))
         gt_strength = dict(Gg.degree(weight="weight"))
 
-        # NEW #2: Weighted clustering coefficient
         pred_clust = nx.clustering(Gp, weight="weight")
         gt_clust = nx.clustering(Gg, weight="weight")
 
-        # Compute node-wise MAE for this sample and add to buckets
         maes["MAE (PC)"].append(_avg_node_mae(pred_pc, gt_pc))
         maes["MAE (EC)"].append(_avg_node_mae(pred_ec, gt_ec))
         maes["MAE (BC)"].append(_avg_node_mae(pred_bc, gt_bc))

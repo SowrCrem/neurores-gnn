@@ -38,7 +38,7 @@ neurores-gnn/
 ├── utils/
 │   ├── matrix_vectorizer.py     # ✅ MatrixVectorizer — column-wise vectorize / anti-vectorize
 │   ├── graph_utils.py           # ✅ Preprocessing, degree normalisation, adj ↔ DGL
-│   ├── metrics.py               # ✅ All 8 metrics (MAE, PCC, JSD, BC, EC, PC, Strength, CC)
+│   ├── metrics.py               # ✅ All 8 metrics (6 required + 2 additional for spec §II.A.a)
 │   ├── plotting.py              # ✅ Plotting of metrics into bar graphs
 │   └── dgl_compat.py            # ✅ DGL graphbolt compatibility shim
 │
@@ -63,7 +63,7 @@ neurores-gnn/
 ## 🗺️ Implementation Order
 
 ### Phase 1 ✅ — Metrics & infrastructure
-- [x] **`utils/metrics.py`** — all 8 metrics (MAE, PCC, JSD, BC MAE, EC MAE, PC MAE, Node Strength MAE, Clustering Coefficient MAE)
+- [x] **`utils/metrics.py`** — all 8 metrics (6 required + 2 additional: Node Strength, Clustering Coefficient)
 - [x] **`utils/plotting.py`** — fold-wise bar chart visualisation
 - [x] **`utils/matrix_vectorizer.py`** — column-wise vectorize / anti-vectorize
 - [x] **`utils/graph_utils.py`** — preprocessing, degree normalisation, adj ↔ DGL
@@ -83,7 +83,7 @@ neurores-gnn/
 
 ### Phase 4 🔲 — Comparison models  `(spec §3.2B — 6 pts)`
 The spec requires benchmarking against **two** other methods using the same 3-fold CV split:
-- [ ] **SGC baseline** — Simple Graph Convolution ([Tutorial 2](https://github.com/basiralab/DGL/tree/main/Tutorials/Tutorial-2)) — the "naive solution" required by spec
+- [x] **SGC baseline** — `models/sgc_baseline.py` — Simple Graph Convolution ([Tutorial 2](https://github.com/basiralab/DGL/tree/main/Tutorials/Tutorial-2), Wu et al. 2019)
 - [ ] **SOTA comparison** — one of 3 published brain graph super-resolution methods identified in the report (the `gcn-encoder-ca-decoder/` may qualify, or pick a paper)
 - [ ] Train both with 3-fold CV and evaluate on all 8 metrics for the comparison table
 
@@ -197,7 +197,7 @@ See [gcn-encoder-ca-decoder/README.md](gcn-encoder-ca-decoder/README.md) for det
 
 ## 📊 Evaluation Metrics
 
-Eight measures (6 required + 2 additional), computed on vectorised predictions:
+Eight measures (6 required + 2 additional per spec §II.A.a), computed on vectorised predictions:
 
 | Measure | Description |
 |---|---|
@@ -207,8 +207,8 @@ Eight measures (6 required + 2 additional), computed on vectorised predictions:
 | BC MAE | Mean Absolute Error of Betweenness Centrality per subject |
 | EC MAE | Mean Absolute Error of Eigenvector Centrality per subject |
 | PC MAE | Mean Absolute Error of PageRank Centrality per subject |
-| Strength MAE | Mean Absolute Error of Node Strength (weighted degree) per subject |
-| CC MAE | Mean Absolute Error of Weighted Clustering Coefficient per subject |
+| Strength MAE | **Additional** — Node Strength (weighted degree) per subject |
+| CC MAE | **Additional** — Weighted Clustering Coefficient per subject |
 
 Reference implementation: [`evaluation_measures.py`](https://github.com/basiralab/DGL/blob/main/Project/evaluation_measures.py)
 

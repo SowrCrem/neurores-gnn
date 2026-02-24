@@ -1,29 +1,32 @@
 """
 Training loop for the LR -> HR brain graph super-resolution model.
 
-Checkpoint-safe: every N epochs the full training state is written to
-  checkpoints/latest.pt   <- overwritten each save (safe resume point)
-  checkpoints/best.pt     <- only updated when val loss improves
-
-On restart the script automatically detects and loads the latest checkpoint,
-so training resumes from exactly the epoch it was interrupted on.
+3-fold cross-validation with per-fold checkpointing and full metric
+evaluation at the end of each fold.
 
 Usage:
-    python src/train.py --config configs/base_model.yaml
-    python src/train.py --config configs/base_model.yaml --resume          # explicit flag (auto-detected anyway)
-    python src/train.py --config configs/base_model.yaml --resume --checkpoint checkpoints/epoch_050.pt
+    python -m src.train --config configs/base_model.yaml
 """
 
 import argparse
 import os
 import json
 import time
+
+import numpy as np
 import yaml
 import torch
 import torch.nn as nn
+from sklearn.model_selection import KFold
+from torch.utils.data import Subset
+
+from utils.dgl_compat import patch as _patch_dgl; _patch_dgl()
 from dgl.dataloading import GraphDataLoader
 
 from src.dataset import load_train_dataset
+from models.generator import BrainGNNGenerator
+from utils.matrix_vectorizer import MatrixVectorizer
+from utils.metrics import evaluate_fold as compute_metrics
 
 
 # ---------------------------------------------------------------------------
@@ -31,176 +34,207 @@ from src.dataset import load_train_dataset
 # ---------------------------------------------------------------------------
 
 def save_checkpoint(state: dict, checkpoint_dir: str, tag: str = "latest"):
-    """
-    Atomically saves a training state dict.
-
-    Writes to <tag>.tmp first then renames to avoid a corrupt file if the
-    process is killed mid-write (safe after hibernation / power loss).
-    """
+    """Atomically save a training state dict."""
     os.makedirs(checkpoint_dir, exist_ok=True)
     path = os.path.join(checkpoint_dir, f"{tag}.pt")
     tmp_path = path + ".tmp"
     torch.save(state, tmp_path)
-    os.replace(tmp_path, path)          # atomic on POSIX
-
-
-def load_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimizer,
-                    scheduler=None, device: torch.device = torch.device("cpu")) -> dict:
-    """
-    Loads a checkpoint into model/optimizer/scheduler in-place.
-
-    Returns the metadata dict (epoch, best_loss, history).
-    """
-    print(f"Resuming from checkpoint: {path}")
-    ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model"])
-    optimizer.load_state_dict(ckpt["optimizer"])
-    if scheduler is not None and ckpt.get("scheduler") is not None:
-        scheduler.load_state_dict(ckpt["scheduler"])
-    return {
-        "start_epoch": ckpt["epoch"] + 1,
-        "best_loss":   ckpt.get("best_loss", float("inf")),
-        "history":     ckpt.get("history", []),
-    }
-
-
-def find_latest_checkpoint(checkpoint_dir: str) -> str | None:
-    """Returns the path of the most recent checkpoint or None if none exist."""
-    latest = os.path.join(checkpoint_dir, "latest.pt")
-    if os.path.exists(latest):
-        return latest
-    return None
+    os.replace(tmp_path, path)
 
 
 # ---------------------------------------------------------------------------
-# Training loop
+# Model factory
 # ---------------------------------------------------------------------------
 
-def train(config: dict, resume_path: str | None = None):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+def _build_model(config, device):
+    return BrainGNNGenerator(
+        lr_nodes=config["data"]["lr_nodes"],
+        hr_nodes=config["data"]["hr_nodes"],
+        hidden_dim=config["model"]["hidden_dim"],
+        num_layers=config["model"].get("num_layers", 4),
+        dropout=config["model"].get("dropout", 0.1),
+    ).to(device)
 
-    # -- Data ----------------------------------------------------------------
-    dataset = load_train_dataset(threshold=0.0)
-    loader = GraphDataLoader(
-        dataset,
-        batch_size=config["training"]["batch_size"],
-        shuffle=True,
-        drop_last=False,
+
+# ---------------------------------------------------------------------------
+# Single fold
+# ---------------------------------------------------------------------------
+
+def train_fold(config, dataset, train_idx, val_idx, fold_id, device):
+    """Train a single fold and return the best model + val loss."""
+    print(f"\n{'='*60}")
+    print(f"Fold {fold_id}")
+    print(f"  Train: {len(train_idx)} samples | Val: {len(val_idx)} samples")
+    print(f"{'='*60}")
+
+    bs = config["training"]["batch_size"]
+    train_loader = GraphDataLoader(
+        Subset(dataset, train_idx.tolist()),
+        batch_size=bs, shuffle=True, drop_last=False,
+    )
+    val_loader = GraphDataLoader(
+        Subset(dataset, val_idx.tolist()),
+        batch_size=bs, shuffle=False, drop_last=False,
     )
 
-    # -- Model ---------------------------------------------------------------
-    # from models.generator import BrainGNNGenerator
-    # model = BrainGNNGenerator(**config["model"]).to(device)
-    raise NotImplementedError(
-        "Instantiate your model in train() before running. "
-        "Uncomment the BrainGNNGenerator lines above."
-    )
-
+    model = _build_model(config, device)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=config["training"]["learning_rate"],
         weight_decay=config["training"]["weight_decay"],
     )
 
-    # -- Scheduler -----------------------------------------------------------
+    total_epochs = config["training"]["epochs"]
     sched_name = config["training"].get("scheduler", "none").lower()
     if sched_name == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=config["training"]["epochs"]
-        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs)
     elif sched_name == "step":
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
     else:
         scheduler = None
 
-    # -- Resume --------------------------------------------------------------
-    checkpoint_dir = config["logging"]["checkpoint_dir"]
-    start_epoch = 0
-    best_loss = float("inf")
-    history = []                        # list of {"epoch", "loss", "lr"} dicts
-
-    # Auto-detect latest checkpoint if no explicit path given
-    if resume_path is None:
-        resume_path = find_latest_checkpoint(checkpoint_dir)
-
-    if resume_path is not None:
-        meta = load_checkpoint(resume_path, model, optimizer, scheduler, device)
-        start_epoch = meta["start_epoch"]
-        best_loss   = meta["best_loss"]
-        history     = meta["history"]
-        print(f"Resuming at epoch {start_epoch}  (best loss so far: {best_loss:.6f})")
-    else:
-        print("Starting fresh training run.")
-
-    # -- Loop ----------------------------------------------------------------
-    criterion = nn.L1Loss()             # MAE — matches competition metric
-    total_epochs = config["training"]["epochs"]
+    criterion = nn.L1Loss()
     log_interval = config["logging"].get("log_interval", 10)
-    save_interval = config["logging"].get("save_interval", 10)
 
-    for epoch in range(start_epoch, total_epochs):
-        model.train()
-        epoch_loss = 0.0
+    best_val_loss = float("inf")
+    best_state = None
+
+    for epoch in range(total_epochs):
         t0 = time.time()
 
-        for graphs, hr_targets in loader:
-            graphs = graphs.to(device)
-            hr_targets = hr_targets.to(device)
-
+        # --- Train --------------------------------------------------------
+        model.train()
+        train_loss_sum = 0.0
+        for graphs, hr_targets in train_loader:
+            graphs, hr_targets = graphs.to(device), hr_targets.to(device)
             optimizer.zero_grad()
-            preds = model(graphs)               # shape: (B, 35778)
+            preds = model(graphs)
             loss = criterion(preds, hr_targets)
             loss.backward()
             optimizer.step()
-            epoch_loss += loss.item()
+            train_loss_sum += loss.item()
 
         if scheduler is not None:
             scheduler.step()
 
-        avg_loss = epoch_loss / len(loader)
-        current_lr = optimizer.param_groups[0]["lr"]
-        history.append({"epoch": epoch, "loss": avg_loss, "lr": current_lr})
+        train_loss = train_loss_sum / len(train_loader)
+
+        # --- Validate -----------------------------------------------------
+        model.eval()
+        val_loss_sum = 0.0
+        with torch.no_grad():
+            for graphs, hr_targets in val_loader:
+                graphs, hr_targets = graphs.to(device), hr_targets.to(device)
+                preds = model(graphs)
+                val_loss_sum += criterion(preds, hr_targets).item()
+
+        val_loss = val_loss_sum / len(val_loader)
+
+        improved = val_loss < best_val_loss
+        if improved:
+            best_val_loss = val_loss
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
         if (epoch + 1) % log_interval == 0 or epoch == 0:
+            marker = " *" if improved else ""
             elapsed = time.time() - t0
-            print(f"Epoch [{epoch+1:>4}/{total_epochs}]  "
-                  f"loss={avg_loss:.6f}  lr={current_lr:.2e}  "
-                  f"({elapsed:.1f}s)")
+            print(f"  Epoch [{epoch+1:>4}/{total_epochs}]  "
+                  f"train={train_loss:.6f}  val={val_loss:.6f}  "
+                  f"({elapsed:.1f}s){marker}")
 
-        # -- Checkpointing ---------------------------------------------------
-        state = {
-            "epoch":      epoch,
-            "model":      model.state_dict(),
-            "optimizer":  optimizer.state_dict(),
-            "scheduler":  scheduler.state_dict() if scheduler else None,
-            "best_loss":  best_loss,
-            "history":    history,
-            "config":     config,
-        }
+    model.load_state_dict(best_state)
+    print(f"  Best val MAE: {best_val_loss:.6f}")
 
-        if (epoch + 1) % save_interval == 0:
-            save_checkpoint(state, checkpoint_dir, tag="latest")
-            # Also keep a named snapshot every save_interval epochs
-            save_checkpoint(state, checkpoint_dir, tag=f"epoch_{epoch+1:04d}")
+    save_checkpoint(
+        {"model": best_state, "fold": fold_id, "val_loss": best_val_loss, "config": config},
+        config["logging"]["checkpoint_dir"],
+        tag=f"fold_{fold_id}",
+    )
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            state["best_loss"] = best_loss
-            save_checkpoint(state, checkpoint_dir, tag="best")
-            print(f"  → New best: {best_loss:.6f}  (saved best.pt)")
-
-    # Final save
-    save_checkpoint(state, checkpoint_dir, tag="latest")
-    print(f"\nTraining complete. Best MAE: {best_loss:.6f}")
-    _save_history(history, checkpoint_dir)
+    return model, best_val_loss
 
 
-def _save_history(history: list, checkpoint_dir: str):
-    path = os.path.join(checkpoint_dir, "history.json")
-    with open(path, "w") as f:
-        json.dump(history, f, indent=2)
-    print(f"Loss history written to {path}")
+# ---------------------------------------------------------------------------
+# Full-metric evaluation on a fold's validation split
+# ---------------------------------------------------------------------------
+
+def evaluate_on_val(model, dataset, val_idx, config, device):
+    """Run model on the validation split and compute all 8 metrics."""
+    loader = GraphDataLoader(
+        Subset(dataset, val_idx.tolist()),
+        batch_size=config["training"]["batch_size"],
+        shuffle=False, drop_last=False,
+    )
+
+    vectorizer = MatrixVectorizer()
+    hr_nodes = config["data"]["hr_nodes"]
+
+    all_preds, all_targets = [], []
+    model.eval()
+    with torch.no_grad():
+        for graphs, hr_targets in loader:
+            graphs = graphs.to(device)
+            all_preds.append(model(graphs).cpu().numpy())
+            all_targets.append(hr_targets.numpy())
+
+    pred_vecs = np.concatenate(all_preds, axis=0)
+    gt_vecs = np.concatenate(all_targets, axis=0)
+
+    pred_mats = np.stack([vectorizer.anti_vectorize(v, hr_nodes) for v in pred_vecs])
+    gt_mats = np.stack([vectorizer.anti_vectorize(v, hr_nodes) for v in gt_vecs])
+
+    return compute_metrics(pred_mats, gt_mats, verbose=True)
+
+
+# ---------------------------------------------------------------------------
+# 3-fold cross-validation
+# ---------------------------------------------------------------------------
+
+def train_cv(config):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    dataset = load_train_dataset(
+        data_dir=config["data"].get("data_dir", "data"),
+        threshold=0.0,
+    )
+
+    kf = KFold(n_splits=3, shuffle=True, random_state=42)
+    indices = np.arange(len(dataset))
+
+    fold_results = []
+
+    for fold_id, (train_idx, val_idx) in enumerate(kf.split(indices), start=1):
+        model, val_loss = train_fold(
+            config, dataset, train_idx, val_idx, fold_id, device,
+        )
+        print(f"\n  Computing full metrics for fold {fold_id} ...")
+        metrics = evaluate_on_val(model, dataset, val_idx, config, device)
+        fold_results.append({
+            "fold": fold_id,
+            "val_mae": val_loss,
+            "metrics": metrics,
+        })
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print("Cross-Validation Summary")
+    print(f"{'='*60}")
+    for r in fold_results:
+        print(f"  Fold {r['fold']}: val MAE = {r['val_mae']:.6f}")
+    mean_mae = np.mean([r["val_mae"] for r in fold_results])
+    print(f"  Mean val MAE: {mean_mae:.6f}")
+
+    ckpt_dir = config["logging"]["checkpoint_dir"]
+    os.makedirs(ckpt_dir, exist_ok=True)
+    summary_path = os.path.join(ckpt_dir, "cv_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(fold_results, f, indent=2, default=str)
+    print(f"\nCV summary saved to {summary_path}")
+
+    return fold_results
 
 
 # ---------------------------------------------------------------------------
@@ -208,13 +242,11 @@ def _save_history(history: list, checkpoint_dir: str):
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train brain graph super-resolution model")
-    parser.add_argument("--config",     type=str, required=True,
+    parser = argparse.ArgumentParser(
+        description="Train brain graph super-resolution model (3-fold CV)",
+    )
+    parser.add_argument("--config", type=str, required=True,
                         help="Path to YAML config file")
-    parser.add_argument("--resume",     action="store_true",
-                        help="Resume from latest checkpoint (auto-detected if omitted)")
-    parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Explicit checkpoint path to resume from")
     return parser.parse_args()
 
 
@@ -222,9 +254,7 @@ def main():
     args = parse_args()
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
-
-    resume_path = args.checkpoint if args.checkpoint else None
-    train(config, resume_path=resume_path)
+    train_cv(config)
 
 
 if __name__ == "__main__":

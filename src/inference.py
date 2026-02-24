@@ -10,25 +10,28 @@ Submission format (per competition sample_submission.csv):
 
 IDs are assigned sequentially by flattening all subject predictions:
   ID = subject_idx * HR_FEATURES + feature_idx + 1
-  Total rows = 112 subjects × 35778 features = 4,007,136
+  Total rows = 112 subjects x 35778 features = 4,007,136
 
 Usage:
-    python src/inference.py --config configs/base_model.yaml --checkpoint <path>
+    python -m src.inference --config configs/base_model.yaml --checkpoint checkpoints/fold_1.pt
 """
 
 import argparse
 import os
-import yaml
+
 import numpy as np
 import pandas as pd
+import yaml
 import torch
+
+from utils.dgl_compat import patch as _patch_dgl; _patch_dgl()
 import dgl
 from dgl.dataloading import GraphDataLoader
 
 from src.dataset import load_test_dataset
-from utils.graph_utils import preprocess_data
+from models.generator import BrainGNNGenerator
 
-HR_FEATURES = 268 * 267 // 2   # 35778
+HR_FEATURES = 268 * 267 // 2  # 35778
 
 
 def parse_args():
@@ -36,45 +39,34 @@ def parse_args():
     parser.add_argument("--config",     type=str, required=True,  help="Path to YAML config")
     parser.add_argument("--checkpoint", type=str, required=True,  help="Path to model checkpoint")
     parser.add_argument("--output",     type=str, default="submission/submission.csv")
-    parser.add_argument("--data_dir",   type=str, default="data")
     return parser.parse_args()
 
 
-def run_inference(model: torch.nn.Module, dataset, device: torch.device) -> np.ndarray:
-    """
-    Runs the model over the test dataset and returns all predictions stacked
-    into a (N_subjects, HR_FEATURES) numpy array.
-    """
+def run_inference(model: torch.nn.Module, dataset, device: torch.device,
+                  batch_size: int = 16) -> np.ndarray:
+    """Return predictions stacked into a (N_subjects, HR_FEATURES) array."""
     model.eval()
-    loader = GraphDataLoader(dataset, batch_size=1, shuffle=False)
+    loader = GraphDataLoader(dataset, batch_size=batch_size, shuffle=False)
     all_preds = []
 
     with torch.no_grad():
         for batch in loader:
             graph = batch.to(device) if isinstance(batch, dgl.DGLGraph) else batch[0].to(device)
-            pred = model(graph)   # expected shape: (1, 35778) or (35778,)
-            all_preds.append(pred.cpu().numpy().reshape(-1))
+            pred = model(graph)
+            all_preds.append(pred.cpu().numpy())
 
-    return np.stack(all_preds, axis=0)   # (N_subjects, 35778)
+    return np.concatenate(all_preds, axis=0)
 
 
 def predictions_to_submission(preds: np.ndarray, output_path: str):
-    """
-    Converts a (N_subjects, HR_FEATURES) prediction array to the competition
-    submission CSV format.
-
-    Args:
-        preds:       Array of shape (N_subjects, 35778).
-        output_path: Path to write the output CSV.
-    """
-    # Clip negatives as per competition preprocessing requirement
+    """Convert (N_subjects, HR_FEATURES) predictions to competition CSV."""
     preds = np.clip(preds, a_min=0.0, a_max=None)
 
     n_subjects, n_features = preds.shape
     ids = np.arange(1, n_subjects * n_features + 1)
     flat_preds = preds.reshape(-1)
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     submission = pd.DataFrame({"ID": ids, "Predicted": flat_preds})
     submission.to_csv(output_path, index=False)
     print(f"Submission saved to {output_path}  ({len(submission):,} rows)")
@@ -87,16 +79,26 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load test dataset
-    test_dataset = load_test_dataset(data_dir=args.data_dir)
+    test_dataset = load_test_dataset(
+        data_dir=config["data"].get("data_dir", "data"),
+    )
 
-    # Load model
-    # from models.generator import BrainGNNGenerator
-    # model = BrainGNNGenerator(**config["model"]).to(device)
-    # model.load_state_dict(torch.load(args.checkpoint, map_location=device))
-    raise NotImplementedError("Instantiate your model here before running inference.")
+    model = BrainGNNGenerator(
+        lr_nodes=config["data"]["lr_nodes"],
+        hr_nodes=config["data"]["hr_nodes"],
+        hidden_dim=config["model"]["hidden_dim"],
+        num_layers=config["model"].get("num_layers", 4),
+        dropout=config["model"].get("dropout", 0.1),
+    ).to(device)
 
-    preds = run_inference(model, test_dataset, device)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model"])
+    print(f"Loaded checkpoint: {args.checkpoint}")
+
+    preds = run_inference(
+        model, test_dataset, device,
+        batch_size=config["training"].get("batch_size", 16),
+    )
     predictions_to_submission(preds, args.output)
 
 

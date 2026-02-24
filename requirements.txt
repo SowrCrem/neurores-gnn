@@ -8,6 +8,7 @@ scipy
 pandas
 scikit-learn
 kaggle
+networkx
 
 # Config & utils
 pyyaml

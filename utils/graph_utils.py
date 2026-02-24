@@ -92,10 +92,11 @@ def adj_to_dgl_graph(adj: np.ndarray, threshold: float = 0.0):
         DGL graph with N nodes.
     """
     import dgl, torch
+    n = adj.shape[0]
     src, dst = np.where(adj > threshold)
     weights = adj[src, dst].astype(np.float32)
 
-    g = dgl.graph((src, dst))
+    g = dgl.graph((src, dst), num_nodes=n)
     g.edata['w'] = torch.tensor(weights)
     g.ndata['feat'] = torch.tensor(adj, dtype=torch.float32)
     return g

@@ -19,6 +19,8 @@ import os
 import pandas as pd
 import numpy as np
 import torch
+
+from utils.dgl_compat import patch as _patch_dgl; _patch_dgl()
 import dgl
 from dgl.data import DGLDataset
 

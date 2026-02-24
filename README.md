@@ -27,19 +27,20 @@ neurores-gnn/
 │   └── lr_test.csv              #   (112, 12720)  LR test subjects (no labels)
 │
 ├── models/
-│   ├── generator.py             # ✅ BrainGNNGenerator stub (implement body)
-│   └── layers.py                # ✅ GraphConvBlock stub (implement body)
+│   ├── generator.py             # ✅ BrainGNNGenerator (GNN body → upsample → bilinear decoder)
+│   └── layers.py                # ✅ GraphConvBlock (GCN + edge weights + residual + LN)
 │
 ├── src/
 │   ├── dataset.py               # ✅ BrainGraphDataset — loads, preprocesses, anti-vectorizes
-│   ├── train.py                 # ✅ Checkpoint-safe loop skeleton (TODO: 3-fold CV + model body)
-│   └── inference.py             # ✅ Submission formatter (TODO: wire up model)
+│   ├── train.py                 # ✅ 3-fold CV training with per-fold checkpointing + metrics
+│   └── inference.py             # ✅ Batched inference + Kaggle submission CSV
 │
 ├── utils/
 │   ├── matrix_vectorizer.py     # ✅ MatrixVectorizer — column-wise vectorize / anti-vectorize
 │   ├── graph_utils.py           # ✅ Preprocessing, degree normalisation, adj ↔ DGL
-│   └── metrics.py               # ✅ Calculation of MAE, PCC, JSD, BC, EC, PC + 2 custom measures
-│   └── plotting.py              # ✅ Plotting of metrics into bar graphs
+│   ├── metrics.py               # ✅ All 8 metrics (MAE, PCC, JSD, BC, EC, PC, Strength, CC)
+│   ├── plotting.py              # ✅ Plotting of metrics into bar graphs
+│   └── dgl_compat.py            # ✅ DGL graphbolt compatibility shim
 │
 ├── notebooks/
 │   ├── devec_check.ipynb        # ✅ Vectorization validation
@@ -61,31 +62,67 @@ neurores-gnn/
 
 ## 🗺️ Implementation Order
 
-### Phase 1 — Metrics & infrastructure  `(unblocks everything)`
-- [ ] **`utils/metrics.py`** — implement all 6 required measures (MAE, PCC, JSD, BC MAE, EC MAE, PC MAE) + 2 additional topological measures of choice
-- [ ] **`requirements.txt`** — add `networkx` (needed for centrality measures)
-- [ ] **`src/train.py`** — replace skeleton loop with 3-fold CV (`KFold(n_splits=3, shuffle=True, random_state=42)`), add seed setup from `reproducibility.py`
+### Phase 1 ✅ — Metrics & infrastructure
+- [x] **`utils/metrics.py`** — all 8 metrics (MAE, PCC, JSD, BC MAE, EC MAE, PC MAE, Node Strength MAE, Clustering Coefficient MAE)
+- [x] **`utils/plotting.py`** — fold-wise bar chart visualisation
+- [x] **`utils/matrix_vectorizer.py`** — column-wise vectorize / anti-vectorize
+- [x] **`utils/graph_utils.py`** — preprocessing, degree normalisation, adj ↔ DGL
+- [x] **`src/dataset.py`** — `BrainGraphDataset` (load, preprocess, anti-vectorize)
+- [x] **`configs/base_model.yaml`** — hyperparameter config
+- [x] **`requirements.txt`** — all dependencies including `networkx`
 
-### Phase 2 — Model architecture  `(the main work)`
-- [ ] **`models/layers.py`** — implement `GraphConvBlock` (GCN/GAT conv + residual + dropout)
-- [ ] **`models/generator.py`** — implement `BrainGNNGenerator`: GNN body → learned 160→268 node upsample → pairwise edge prediction head → post-process (clip ≥ 0)
+### Phase 2 ✅ — Reference model (SOTA comparison candidate)
+- [x] **`gcn-encoder-ca-decoder/`** — GCN Encoder + Cross-Attention Decoder (coded, not yet trained/evaluated)
+- [x] **`notebooks/modular_pipeline.ipynb`** — modular pipeline template (DataModule, Preprocessing, Model, Training, CV, Submission)
 
-### Phase 3 — Baseline for comparison  `(required by spec)`
-- [ ] **`models/sgc_baseline.py`** — Simple Graph Convolution baseline (spec requires benchmarking against it)
+### Phase 3 ✅ — Proposed model architecture
+- [x] **`models/layers.py`** — `GraphConvBlock` (GCN message passing + edge weights + residual + LayerNorm + dropout)
+- [x] **`models/generator.py`** — `BrainGNNGenerator` (GNN body → learned node upsample → bilinear edge decoder)
+- [x] **`src/train.py`** — 3-fold CV with per-fold checkpointing + full 8-metric evaluation
+- [x] **`src/inference.py`** — batched inference with checkpoint loading + submission CSV
 
-### Phase 4 — Submission notebook  `(final deliverable)`
-- [ ] **`notebooks/main.ipynb`** — single-run notebook:
-  - Seed setup
-  - 3-fold CV training loop calling `src/train.py`
-  - Evaluation on all 8 metrics per fold
-  - Bar plots with std error bars across folds
-  - Save `submission/predictions_fold_{0,1,2}.csv`
-  - Retrain on full dataset → save `submission/submission.csv` for Kaggle
+### Phase 4 🔲 — Comparison models  `(spec §3.2B — 6 pts)`
+The spec requires benchmarking against **two** other methods using the same 3-fold CV split:
+- [ ] **SGC baseline** — Simple Graph Convolution ([Tutorial 2](https://github.com/basiralab/DGL/tree/main/Tutorials/Tutorial-2)) — the "naive solution" required by spec
+- [ ] **SOTA comparison** — one of 3 published brain graph super-resolution methods identified in the report (the `gcn-encoder-ca-decoder/` may qualify, or pick a paper)
+- [ ] Train both with 3-fold CV and evaluate on all 8 metrics for the comparison table
 
-### Phase 5 — Polish
-- [ ] Post-processing: ensure all outputs clipped to `[0, 1]`
-- [ ] Verify submission CSV format matches `sample_submission.csv` exactly
-- [ ] Final Kaggle submission before March 6
+### Phase 5 🔲 — Submission notebook  `(spec §3.1 — 20 pts)`
+- [ ] **`notebooks/main.ipynb`** — single-run notebook that generates **all** outputs:
+  - Reproducibility setup (`reproducibility.py` seed config at top)
+  - Receives train/test data + model params as function parameters
+  - 3-fold CV training of proposed model (`KFold(n_splits=3, shuffle=True, random_state=42)`)
+  - `predictions_fold_{0,1,2}.csv` — Kaggle format (ID + Predicted columns, 4,007,136 rows each)
+  - Bar plots of all 8 metrics per fold with std error bars (see spec Fig. 5)
+  - Retrain on full 167 training set → predict test_HR → `submission/submission.csv` for Kaggle
+  - Explanatory comments throughout
+
+### Phase 6 🔲 — Kaggle submission  `(spec §2 — 5 pts)`
+- [ ] Team registered on Kaggle competition
+- [ ] Upload `submission.csv` (ID + Predicted, 4,007,136 rows) before **March 6**
+- [ ] Post-process: all predictions clipped to `[0, ∞)` (no negatives)
+- [ ] Verify CSV format matches `sample_submission.csv` exactly
+
+### Phase 7 🔲 — Report  `(spec §3.2 — 75 pts, deadline March 9)`
+IEEE Conference Paper template, max 5 pages + optional pipeline figure page.
+
+**Methodology & Novelty (40 pts):**
+- [ ] Problem description & motivation (5)
+- [ ] State-of-the-art: identify 3 GNN-based brain graph SR papers in Table I (3)
+- [ ] Main figure: learning pipeline diagram showing train + test flow (4)
+- [ ] Brief overview of proposed GNN architecture (5)
+- [ ] Two novel contributions vs. existing SOTA in Table II (10)
+- [ ] Mathematical properties: permutation invariance (5), equivariance (5), expressiveness (3)
+
+**Experimental Setup & Evaluation (27 pts):**
+- [ ] Results: 3-fold CV plots (8 measures), training time + RAM usage, Kaggle score (9)
+- [ ] Comparison: proposed model vs. SGC baseline vs. SOTA method, quantitative (6)
+- [ ] Scalability analysis (7)
+- [ ] Reproducibility analysis (5)
+
+**Discussion & Reflections (8 pts):**
+- [ ] Two strengths + two weaknesses in Table IV (4)
+- [ ] Two key improvements / future work directions (4)
 
 ---
 
@@ -149,8 +186,10 @@ Located in `gcn-encoder-ca-decoder/` — a self-contained reference implementati
 **Training**: 3-fold CV with MSE loss
 
 **Hyperparameters** (see `gcn-encoder-ca-decoder/config.py`):
-- `d_model=64`, `gcn_layers=2`, `attn_heads=4`
-- `epochs=50`, `batch_size=8`, `lr=1e-3`
+- `d_model=128`, `gcn_layers=3`, `attn_heads=4`, `dropout=0.1`
+- `epochs=60`, `batch_size=16`, `lr=1e-3`, `weight_decay=1e-5`
+
+**Status:** Code complete but not yet trained — no logs or outputs produced.
 
 See [gcn-encoder-ca-decoder/README.md](gcn-encoder-ca-decoder/README.md) for detailed documentation.
 
@@ -158,7 +197,7 @@ See [gcn-encoder-ca-decoder/README.md](gcn-encoder-ca-decoder/README.md) for det
 
 ## 📊 Evaluation Metrics
 
-Six measures required by the spec (computed on vectorised, flattened predictions):
+Eight measures (6 required + 2 additional), computed on vectorised predictions:
 
 | Measure | Description |
 |---|---|
@@ -168,7 +207,8 @@ Six measures required by the spec (computed on vectorised, flattened predictions
 | BC MAE | Mean Absolute Error of Betweenness Centrality per subject |
 | EC MAE | Mean Absolute Error of Eigenvector Centrality per subject |
 | PC MAE | Mean Absolute Error of PageRank Centrality per subject |
-| + 2 | Additional topological/geometric measures (TBD) |
+| Strength MAE | Mean Absolute Error of Node Strength (weighted degree) per subject |
+| CC MAE | Mean Absolute Error of Weighted Clustering Coefficient per subject |
 
 Reference implementation: [`evaluation_measures.py`](https://github.com/basiralab/DGL/blob/main/Project/evaluation_measures.py)
 
@@ -183,17 +223,20 @@ LR adjacency (160×160)
 [anti-vectorize → DGL graph]    node features = rows of LR adj (160-dim each)
         │
         ▼
+[Input projection]              Linear(160 → d) + LayerNorm + ReLU
+        │
+        ▼
 [GNN body]                      GraphConvBlock × N  →  node embeddings (160, d)
         │
         ▼
-[Node upsample]                 Linear(160 → 268)   →  HR node embeddings (268, d)
+[Node upsample]                 Learned linear (160 → 268) over node dimension
         │
         ▼
-[Edge prediction head]          for each HR pair (i,j): MLP(h_i ‖ h_j) → w_ij
+[Bilinear edge decoder]         h W hᵀ → (268×268), symmetrised
         │
         ▼
-[Post-process]                  clip to [0, 1]
+[Post-process]                  clamp ≥ 0, extract upper triangle
         │
         ▼
-HR vector (35778,)              re-vectorize upper triangle
+HR vector (35778,)              predicted edge weights
 ```

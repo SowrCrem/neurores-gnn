@@ -3,6 +3,7 @@ data/
 submission/
 checkpoints/
 *.zip
+submission.csv
 
 # Python
 __pycache__/

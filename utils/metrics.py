@@ -29,7 +29,10 @@ import networkx as nx
 from sklearn.metrics import mean_absolute_error
 from scipy.stats import pearsonr
 from scipy.spatial.distance import jensenshannon
-from tqdm import tqdm
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    from tqdm import tqdm
 
 from utils.matrix_vectorizer import MatrixVectorizer
 
@@ -123,26 +126,31 @@ def _normalize_to_prob(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
 
 def _safe_ec(G: nx.Graph) -> dict:
     """
-    Compute eigenvector centrality robustly.
+    Compute eigenvector centrality robustly, handling disconnected graphs.
 
-    `nx.eigenvector_centrality` uses power iteration and can fail to converge,
-    especially for certain graphs. We attempt the NumPy-based method first,
-    then fall back to iterative if needed.
-
-    Parameters
-    ----------
-    G : nx.Graph
-        Weighted (or unweighted) graph.
-
-    Returns
-    -------
-    dict
-        Node -> eigenvector centrality score.
+    Attempts: (1) numpy method, (2) power iteration, (3) EC on largest
+    connected component with 0 for nodes outside it.
     """
     try:
         return nx.eigenvector_centrality_numpy(G, weight="weight")
     except Exception:
+        pass
+    try:
         return nx.eigenvector_centrality(G, weight="weight", max_iter=2000, tol=1e-8)
+    except Exception:
+        pass
+    result = {n: 0.0 for n in G.nodes()}
+    largest_cc = max(nx.connected_components(G), key=len)
+    sub = G.subgraph(largest_cc).copy()
+    try:
+        ec = nx.eigenvector_centrality_numpy(sub, weight="weight")
+    except Exception:
+        try:
+            ec = nx.eigenvector_centrality(sub, weight="weight", max_iter=2000, tol=1e-8)
+        except Exception:
+            return result
+    result.update(ec)
+    return result
 
 
 def _avg_node_mae(d_pred: dict, d_gt: dict) -> float:

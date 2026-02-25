@@ -122,21 +122,19 @@ def plot_folds(fold_results: list[dict], split_if_obscured: bool = True, verbose
         print(f"Plotting {len(fold_results)} fold(s).")
         print(f"Scale ratio (max/min over finite values): {ratio:.3f}")
 
-    # # If values vary dramatically, split into matrix vs graph plots
-    # if split_if_obscured and ratio > 20:
-    #     matrix_metrics = ["MAE", "PCC", "JSD"]
-    #     graph_metrics = [k for k in METRIC_ORDER if k not in matrix_metrics]
+    if split_if_obscured and ratio > 20:
+        matrix_metrics = ["MAE", "PCC", "JSD"]
+        graph_metrics = [k for k in METRIC_ORDER if k not in matrix_metrics]
 
-    #     if verbose:
-    #         print("Splitting plots into:")
-    #         print(f"  Matrix-level metrics: {matrix_metrics}")
-    #         print(f"  Graph-level metrics : {graph_metrics}")
+        if verbose:
+            print("Scale disparity detected — splitting into two figures:")
+            print(f"  Matrix-level metrics: {matrix_metrics}")
+            print(f"  Graph-level metrics : {graph_metrics}")
 
-    #     _plot_grid(fold_results, means, stds, matrix_metrics, suptitle="Matrix-level Metrics")
-    #     _plot_grid(fold_results, means, stds, graph_metrics, suptitle="Graph-level Metrics")
-    #     return
+        _plot_grid(fold_results, means, stds, matrix_metrics, suptitle="Matrix-level Metrics")
+        _plot_grid(fold_results, means, stds, graph_metrics, suptitle="Graph-level Metrics")
+        return
 
-    # Default: plot all metrics together in one 2x2 grid
     _plot_grid(fold_results, means, stds, METRIC_ORDER, suptitle=None)
 
 

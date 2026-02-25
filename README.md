@@ -198,6 +198,12 @@ IEEE Conference Paper template, max 5 pages + optional pipeline figure page.
     - runtime + RAM usage table,
     - report-ready text snippets for section II-A.
 
+### Current DenseGCN status (quick reference)
+- `v1` submission (`dense_gcn_v1_submission.csv`) remains the strongest non-full-retrain baseline.
+- `v3` CV-ensemble (`dense_gcn_v3_ensemble_submission.csv`) improves over `v2` but may still trail `v1`.
+- `v3` full retrain (`dense_gcn_v3_full_retrain_submission.csv`) can substantially improve leaderboard MAE.
+- For report compliance, use: **3F-CV for model selection** -> **full retrain on all 167** -> **predict test_LR**.
+
 10. **Final submission**:
     Open `notebooks/main.ipynb` and run all cells — produces bar plots and `submission/predictions_fold_{0,1,2}.csv`.
 

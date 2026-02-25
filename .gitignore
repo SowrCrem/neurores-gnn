@@ -2,6 +2,7 @@
 data/
 submission/
 checkpoints/
+artifacts/
 *.zip
 submission.csv
 

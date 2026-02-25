@@ -66,6 +66,9 @@ class TrainConfig:
     batch_size: int = 16
     learning_rate: float = 5e-4
     weight_decay: float = 1e-4
+    loss_name: str = "mse"
+    huber_beta: float = 1.0
+    l1_weight: float = 0.7
     seed: int = 42
     num_folds: int = 3
 
@@ -79,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     def add_shared(p: argparse.ArgumentParser) -> None:
         p.add_argument("--data-dir", type=str, default=DEFAULT_DATA_DIR)
         p.add_argument("--out-dir", type=str, default=DEFAULT_OUT_DIR)
+        p.add_argument("--preset", type=str, default="v2", choices=["v2", "v3"])
         p.add_argument("--seed", type=int, default=42)
         p.add_argument("--epochs", type=int, default=400)
         p.add_argument("--patience", type=int, default=30)
@@ -88,6 +92,15 @@ def parse_args() -> argparse.Namespace:
         p.add_argument("--hidden-dim", type=int, default=128)
         p.add_argument("--num-layers", type=int, default=3)
         p.add_argument("--dropout", type=float, default=0.5)
+        p.add_argument(
+            "--loss",
+            type=str,
+            default="mse",
+            choices=["mse", "smoothl1", "l1", "hybrid"],
+            help="Training loss: hybrid = l1_weight*L1 + (1-l1_weight)*MSE",
+        )
+        p.add_argument("--huber-beta", type=float, default=1.0)
+        p.add_argument("--l1-weight", type=float, default=0.7)
         p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
 
     cv = sub.add_parser("cv", help="Run 3-fold CV and log metrics/resources.")
@@ -155,6 +168,71 @@ def build_model(cfg: TrainConfig, device: torch.device) -> DenseGCNGenerator:
     ).to(device)
 
 
+def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
+    """
+    Fill defaults according to an experiment preset.
+
+    v2: existing dense_gcn_v2 baseline.
+    v3: balanced capacity + MAE-aligned objective.
+    """
+    preset_map = {
+        "v2": {
+            "hidden_dim": 128,
+            "num_layers": 3,
+            "dropout": 0.5,
+            "lr": 5e-4,
+            "patience": 30,
+            "loss": "mse",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+        },
+        "v3": {
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 45,
+            "loss": "smoothl1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+        },
+    }
+    chosen = preset_map[args.preset]
+    for k, v in chosen.items():
+        if getattr(args, k) == parse_args_defaults()[k]:
+            setattr(args, k, v)
+    return args
+
+
+def parse_args_defaults() -> dict:
+    """
+    Centralized parser defaults for deciding if user explicitly overrode a flag.
+    """
+    return {
+        "hidden_dim": 128,
+        "num_layers": 3,
+        "dropout": 0.5,
+        "lr": 5e-4,
+        "patience": 30,
+        "loss": "mse",
+        "l1_weight": 0.7,
+        "huber_beta": 1.0,
+    }
+
+
+def build_loss(cfg: TrainConfig) -> nn.Module:
+    if cfg.loss_name == "mse":
+        return nn.MSELoss()
+    if cfg.loss_name == "l1":
+        return nn.L1Loss()
+    if cfg.loss_name == "smoothl1":
+        return nn.SmoothL1Loss(beta=cfg.huber_beta)
+    if cfg.loss_name == "hybrid":
+        # Wrapped below with explicit closure in training loops.
+        return nn.Identity()
+    raise ValueError(f"Unsupported loss: {cfg.loss_name}")
+
+
 def train_with_validation(
     cfg: TrainConfig,
     device: torch.device,
@@ -177,7 +255,7 @@ def train_with_validation(
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
     )
-    loss_fn = nn.MSELoss()
+    base_loss_fn = build_loss(cfg)
 
     best_val = float("inf")
     best_state = None
@@ -189,7 +267,11 @@ def train_with_validation(
         for x_vec, y_vec in tr_loader:
             a = vec_to_adj(x_vec, cfg.n_lr, vectorizer)
             pred = model(a, a)
-            loss = loss_fn(pred, y_vec)
+            if cfg.loss_name == "hybrid":
+                loss = cfg.l1_weight * nn.functional.l1_loss(pred, y_vec) + \
+                    (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
+            else:
+                loss = base_loss_fn(pred, y_vec)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -200,7 +282,13 @@ def train_with_validation(
         with torch.no_grad():
             for x_vec, y_vec in va_loader:
                 a = vec_to_adj(x_vec, cfg.n_lr, vectorizer)
-                val_losses.append(loss_fn(model(a, a), y_vec).item())
+                pred = model(a, a)
+                if cfg.loss_name == "hybrid":
+                    val_loss = cfg.l1_weight * nn.functional.l1_loss(pred, y_vec) + \
+                        (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
+                else:
+                    val_loss = base_loss_fn(pred, y_vec)
+                val_losses.append(val_loss.item())
 
         val_loss = float(np.mean(val_losses))
         improved = val_loss < best_val
@@ -246,7 +334,7 @@ def train_full(
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
     )
-    loss_fn = nn.MSELoss()
+    base_loss_fn = build_loss(cfg)
 
     for epoch in range(1, cfg.epochs + 1):
         model.train()
@@ -254,7 +342,11 @@ def train_full(
         for x_vec, y_vec in loader:
             a = vec_to_adj(x_vec, cfg.n_lr, vectorizer)
             pred = model(a, a)
-            loss = loss_fn(pred, y_vec)
+            if cfg.loss_name == "hybrid":
+                loss = cfg.l1_weight * nn.functional.l1_loss(pred, y_vec) + \
+                    (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
+            else:
+                loss = base_loss_fn(pred, y_vec)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -300,6 +392,7 @@ def write_json(path: Path, payload: dict) -> None:
 
 
 def run_cv(args: argparse.Namespace) -> None:
+    args = apply_preset(args)
     cfg = TrainConfig(
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
@@ -309,6 +402,9 @@ def run_cv(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
+        loss_name=args.loss,
+        huber_beta=args.huber_beta,
+        l1_weight=args.l1_weight,
         seed=args.seed,
         num_folds=args.num_folds,
     )
@@ -399,7 +495,7 @@ def run_cv(args: argparse.Namespace) -> None:
     mean_metrics, std_metrics = summarize_folds(fold_metric_dicts)
 
     cv_summary = {
-        "task": "dense_gcn_v2_3fold_cv",
+        "task": f"dense_gcn_{args.preset}_3fold_cv",
         "device": str(device),
         "config": asdict(cfg),
         "folds": fold_records,
@@ -408,7 +504,7 @@ def run_cv(args: argparse.Namespace) -> None:
         "std_metrics": std_metrics,
     }
     resource_summary = {
-        "task": "dense_gcn_v2_3fold_cv",
+        "task": f"dense_gcn_{args.preset}_3fold_cv",
         "device": str(device),
         "total_cv_seconds": total_seconds,
         "total_cv_minutes": total_seconds / 60.0,
@@ -432,6 +528,7 @@ def run_cv(args: argparse.Namespace) -> None:
 
 
 def run_full(args: argparse.Namespace) -> None:
+    args = apply_preset(args)
     cfg = TrainConfig(
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
@@ -441,6 +538,9 @@ def run_full(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
+        loss_name=args.loss,
+        huber_beta=args.huber_beta,
+        l1_weight=args.l1_weight,
         seed=args.seed,
     )
 
@@ -490,7 +590,7 @@ def run_full(args: argparse.Namespace) -> None:
         peak_ram = np.nanmax([peak_ram, now_ram])
 
     full_summary = {
-        "task": "dense_gcn_v2_full_retrain",
+        "task": f"dense_gcn_{args.preset}_full_retrain",
         "device": str(device),
         "config": asdict(cfg),
         "train_seconds": train_seconds,

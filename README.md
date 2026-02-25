@@ -44,6 +44,9 @@ neurores-gnn/
 │
 ├── notebooks/
 │   ├── devec_check.ipynb        # ✅ Vectorization validation
+│   ├── dense_gcn_analysis.ipynb # ✅ Canonical analysis notebook (reads script artifacts)
+│   ├── dense_gcn_v1.ipynb       # 📌 Legacy experiment log (training moved to script)
+│   ├── dense_gcn_v2.ipynb       # 📌 Legacy experiment log (training moved to script)
 │   ├── modular_pipeline.ipynb   # 🔲 (in-progress) Modular ML pipeline template
 │   └── main.ipynb               # 🔲 TODO: submission deliverable
 │
@@ -177,14 +180,30 @@ IEEE Conference Paper template, max 5 pages + optional pipeline figure page.
     # Retrain on full train_LR/train_HR (167) + predict test_LR + save submission
     python -m src.train_dense_gcn full
     ```
-    Outputs are written to:
-    - `artifacts/dense_gcn_v2/cv_summary.json`
-    - `artifacts/dense_gcn_v2/resource_summary.json`
-    - `artifacts/dense_gcn_v2/full_retrain_summary.json`
-    - `submission/dense_gcn_v2_full_retrain_submission.csv`
+    For the balanced **v3 preset** (higher capacity + MAE-aligned loss):
+    ```bash
+    python -m src.train_dense_gcn cv --preset v3
+    python -m src.train_dense_gcn full --preset v3 --submission-path submission/dense_gcn_v3_full_retrain_submission.csv
+    ```
+    Outputs are written to the chosen `--out-dir`, for example:
+    - `artifacts/dense_gcn_v3/cv_summary.json`
+    - `artifacts/dense_gcn_v3/resource_summary.json`
+    - `artifacts/dense_gcn_v3/full_retrain_summary.json`
+    - `submission/dense_gcn_v3_full_retrain_submission.csv`
 
-9. **Final submission**:
+9. **Analyse and report from artifacts**:
+    Open `notebooks/dense_gcn_analysis.ipynb`, set `ARTIFACT_DIR`, and run all cells to generate:
+    - 8-metric fold plots,
+    - mean/std tables,
+    - runtime + RAM usage table,
+    - report-ready text snippets for section II-A.
+
+10. **Final submission**:
     Open `notebooks/main.ipynb` and run all cells — produces bar plots and `submission/predictions_fold_{0,1,2}.csv`.
+
+### Legacy notebooks
+- `notebooks/dense_gcn_v1.ipynb` and `notebooks/dense_gcn_v2.ipynb` are kept for experiment history.
+- Canonical workflow is now: `src/train_dense_gcn.py` (training/inference) + `notebooks/dense_gcn_analysis.ipynb` (visualization/reporting).
 
 ---
 

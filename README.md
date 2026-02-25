@@ -169,7 +169,21 @@ IEEE Conference Paper template, max 5 pages + optional pipeline figure page.
     # resumes automatically from checkpoints/latest.pt after hibernation
     ```
 
-8. **Final submission**:
+8. **DenseGCN v2 (script-first, no notebook redefinition)**:
+    ```bash
+    # 3-fold CV + all 8 metrics + total runtime + peak RAM logs
+    python -m src.train_dense_gcn cv
+
+    # Retrain on full train_LR/train_HR (167) + predict test_LR + save submission
+    python -m src.train_dense_gcn full
+    ```
+    Outputs are written to:
+    - `artifacts/dense_gcn_v2/cv_summary.json`
+    - `artifacts/dense_gcn_v2/resource_summary.json`
+    - `artifacts/dense_gcn_v2/full_retrain_summary.json`
+    - `submission/dense_gcn_v2_full_retrain_submission.csv`
+
+9. **Final submission**:
     Open `notebooks/main.ipynb` and run all cells — produces bar plots and `submission/predictions_fold_{0,1,2}.csv`.
 
 ---

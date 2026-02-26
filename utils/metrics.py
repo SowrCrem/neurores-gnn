@@ -24,6 +24,9 @@ Notes:
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 import networkx as nx
 from sklearn.metrics import mean_absolute_error
@@ -185,7 +188,8 @@ def evaluate_fold(
     pred_mats: np.ndarray,
     gt_mats: np.ndarray,
     ignore_diagonal: bool = True,
-    verbose: bool = True
+    verbose: bool = True,
+    cache_path: str | Path | None = None,
 ) -> dict:
     """
     Evaluate a fold (or any batch) of predicted vs ground-truth adjacency matrices.
@@ -265,17 +269,24 @@ def evaluate_fold(
 
     # -------------------------------------------------------------------------
     # 2) Graph-level metrics: compute node-measures per sample, then average MAE
+    #    Supports incremental caching so the run can resume after interruption.
     # -------------------------------------------------------------------------
-    maes = {
-        "MAE (PC)": [],
-        "MAE (EC)": [],
-        "MAE (BC)": [],
-        "MAE (Strength)": [],
-        "MAE (Clustering)": [],
-    }
+    GRAPH_METRIC_KEYS = ["MAE (PC)", "MAE (EC)", "MAE (BC)", "MAE (Strength)", "MAE (Clustering)"]
+
+    cached_samples: list[dict] = []
+    if cache_path is not None:
+        cache_path = Path(cache_path)
+        if cache_path.exists():
+            with open(cache_path, "r", encoding="utf-8") as _cf:
+                cached_samples = json.load(_cf)
+            if verbose:
+                print(f"  Resuming graph metrics from cache ({len(cached_samples)}/{pred_mats.shape[0]} samples done)")
 
     n_samples = pred_mats.shape[0]
-    for i in tqdm(range(n_samples), desc="Graph metrics", disable=not verbose):
+    start_idx = len(cached_samples)
+
+    for i in tqdm(range(start_idx, n_samples), desc="Graph metrics", disable=not verbose,
+                  initial=start_idx, total=n_samples):
         p = _mask_diagonal(pred_mats[i]) if ignore_diagonal else pred_mats[i]
         g = _mask_diagonal(gt_mats[i]) if ignore_diagonal else gt_mats[i]
 
@@ -297,11 +308,20 @@ def evaluate_fold(
         pred_clust = nx.clustering(Gp, weight="weight")
         gt_clust = nx.clustering(Gg, weight="weight")
 
-        maes["MAE (PC)"].append(_avg_node_mae(pred_pc, gt_pc))
-        maes["MAE (EC)"].append(_avg_node_mae(pred_ec, gt_ec))
-        maes["MAE (BC)"].append(_avg_node_mae(pred_bc, gt_bc))
-        maes["MAE (Strength)"].append(_avg_node_mae(pred_strength, gt_strength))
-        maes["MAE (Clustering)"].append(_avg_node_mae(pred_clust, gt_clust))
+        cached_samples.append({
+            "MAE (PC)": float(_avg_node_mae(pred_pc, gt_pc)),
+            "MAE (EC)": float(_avg_node_mae(pred_ec, gt_ec)),
+            "MAE (BC)": float(_avg_node_mae(pred_bc, gt_bc)),
+            "MAE (Strength)": float(_avg_node_mae(pred_strength, gt_strength)),
+            "MAE (Clustering)": float(_avg_node_mae(pred_clust, gt_clust)),
+        })
+
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as _cf:
+                json.dump(cached_samples, _cf)
+
+    maes = {k: [s[k] for s in cached_samples] for k in GRAPH_METRIC_KEYS}
 
     # Average graph-level MAEs across samples
     out = {

@@ -32,6 +32,7 @@ from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader, TensorDataset
 
 from models.dense_gcn import DenseGCNGenerator
+from models.dense_gat import DenseGATGenerator
 from utils.matrix_vectorizer import MatrixVectorizer
 from utils.metrics import METRIC_ORDER, evaluate_fold
 from utils.plotting import summarize_folds
@@ -56,6 +57,7 @@ HR_FEATURES = N_HR * (N_HR - 1) // 2  # 35778
 
 @dataclass
 class TrainConfig:
+    model_name: str = "dense_gcn"
     n_lr: int = N_LR
     n_hr: int = N_HR
     hidden_dim: int = 128
@@ -71,6 +73,11 @@ class TrainConfig:
     l1_weight: float = 0.7
     seed: int = 42
     num_folds: int = 3
+    # GAT-specific (ignored for dense_gcn)
+    num_heads: int = 4
+    ffn_mult: int = 4
+    num_decoder_heads: int = 4
+    hr_refine_layers: int = 1
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,7 +89,8 @@ def parse_args() -> argparse.Namespace:
     def add_shared(p: argparse.ArgumentParser) -> None:
         p.add_argument("--data-dir", type=str, default=DEFAULT_DATA_DIR)
         p.add_argument("--out-dir", type=str, default=DEFAULT_OUT_DIR)
-        p.add_argument("--preset", type=str, default="v2", choices=["v2", "v3"])
+        p.add_argument("--preset", type=str, default="v2", choices=["v2", "v3", "v4"])
+        p.add_argument("--model", type=str, default="dense_gcn", choices=["dense_gcn", "dense_gat"])
         p.add_argument("--seed", type=int, default=42)
         p.add_argument("--epochs", type=int, default=400)
         p.add_argument("--patience", type=int, default=30)
@@ -102,6 +110,11 @@ def parse_args() -> argparse.Namespace:
         p.add_argument("--huber-beta", type=float, default=1.0)
         p.add_argument("--l1-weight", type=float, default=0.7)
         p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+        # GAT-specific
+        p.add_argument("--num-heads", type=int, default=4)
+        p.add_argument("--ffn-mult", type=int, default=4)
+        p.add_argument("--num-decoder-heads", type=int, default=4)
+        p.add_argument("--hr-refine-layers", type=int, default=1)
 
     cv = sub.add_parser("cv", help="Run 3-fold CV and log metrics/resources.")
     add_shared(cv)
@@ -158,7 +171,19 @@ def vec_to_adj(vec: torch.Tensor, n: int, vectorizer: MatrixVectorizer) -> torch
     return torch.from_numpy(np.stack(mats)).to(device=vec.device, dtype=vec.dtype)
 
 
-def build_model(cfg: TrainConfig, device: torch.device) -> DenseGCNGenerator:
+def build_model(cfg: TrainConfig, device: torch.device) -> nn.Module:
+    if cfg.model_name == "dense_gat":
+        return DenseGATGenerator(
+            n_lr=cfg.n_lr,
+            n_hr=cfg.n_hr,
+            hidden_dim=cfg.hidden_dim,
+            num_layers=cfg.num_layers,
+            num_heads=cfg.num_heads,
+            dropout=cfg.dropout,
+            ffn_mult=cfg.ffn_mult,
+            num_decoder_heads=cfg.num_decoder_heads,
+            hr_refine_layers=cfg.hr_refine_layers,
+        ).to(device)
     return DenseGCNGenerator(
         n_lr=cfg.n_lr,
         n_hr=cfg.n_hr,
@@ -174,9 +199,11 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
 
     v2: existing dense_gcn_v2 baseline.
     v3: balanced capacity + MAE-aligned objective.
+    v4: DenseGATNet — graph-attention encoder + multi-head bilinear decoder.
     """
     preset_map = {
         "v2": {
+            "model": "dense_gcn",
             "hidden_dim": 128,
             "num_layers": 3,
             "dropout": 0.5,
@@ -185,8 +212,13 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
             "loss": "mse",
             "l1_weight": 0.7,
             "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
         },
         "v3": {
+            "model": "dense_gcn",
             "hidden_dim": 192,
             "num_layers": 3,
             "dropout": 0.35,
@@ -195,11 +227,31 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
             "loss": "smoothl1",
             "l1_weight": 0.7,
             "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+        },
+        "v4": {
+            "model": "dense_gat",
+            "hidden_dim": 192,
+            "num_layers": 4,
+            "dropout": 0.25,
+            "lr": 5e-4,
+            "patience": 50,
+            "loss": "smoothl1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
         },
     }
     chosen = preset_map[args.preset]
+    defaults = parse_args_defaults()
     for k, v in chosen.items():
-        if getattr(args, k) == parse_args_defaults()[k]:
+        if getattr(args, k) == defaults[k]:
             setattr(args, k, v)
     return args
 
@@ -209,6 +261,7 @@ def parse_args_defaults() -> dict:
     Centralized parser defaults for deciding if user explicitly overrode a flag.
     """
     return {
+        "model": "dense_gcn",
         "hidden_dim": 128,
         "num_layers": 3,
         "dropout": 0.5,
@@ -217,6 +270,10 @@ def parse_args_defaults() -> dict:
         "loss": "mse",
         "l1_weight": 0.7,
         "huber_beta": 1.0,
+        "num_heads": 4,
+        "ffn_mult": 4,
+        "num_decoder_heads": 4,
+        "hr_refine_layers": 1,
     }
 
 
@@ -275,6 +332,8 @@ def train_with_validation(
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if cfg.model_name == "dense_gat":
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
         model.eval()
@@ -394,6 +453,7 @@ def write_json(path: Path, payload: dict) -> None:
 def run_cv(args: argparse.Namespace) -> None:
     args = apply_preset(args)
     cfg = TrainConfig(
+        model_name=args.model,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
@@ -407,6 +467,10 @@ def run_cv(args: argparse.Namespace) -> None:
         l1_weight=args.l1_weight,
         seed=args.seed,
         num_folds=args.num_folds,
+        num_heads=args.num_heads,
+        ffn_mult=args.ffn_mult,
+        num_decoder_heads=args.num_decoder_heads,
+        hr_refine_layers=args.hr_refine_layers,
     )
 
     seed_everything(cfg.seed)
@@ -425,13 +489,30 @@ def run_cv(args: argparse.Namespace) -> None:
     vectorizer = MatrixVectorizer()
     kf = KFold(n_splits=cfg.num_folds, shuffle=True, random_state=cfg.seed)
 
-    fold_records = []
-    fold_metric_dicts = []
-    fold_seconds = []
+    # --- Fold-level resume: load progress from previous interrupted run ---
+    progress_path = out_dir / "cv_progress.json"
+    fold_records: list[dict] = []
+    fold_metric_dicts: list[dict] = []
+    fold_seconds: list[float] = []
+    completed_folds: set[int] = set()
+
+    if progress_path.exists():
+        with open(progress_path, "r", encoding="utf-8") as _pf:
+            prior = json.load(_pf)
+        fold_records = prior.get("fold_records", [])
+        fold_metric_dicts = [r["metrics"] for r in fold_records]
+        fold_seconds = [r["fold_seconds"] for r in fold_records]
+        completed_folds = {r["fold"] for r in fold_records}
+        print(f"Resuming CV: {len(completed_folds)} fold(s) already done {sorted(completed_folds)}")
+
     peak_ram = current_ram_gb()
     cv_start = time.perf_counter()
 
     for fold_id, (tr_idx, va_idx) in enumerate(kf.split(x_train), start=1):
+        if fold_id in completed_folds:
+            print(f"\nFold {fold_id}: already completed, skipping.")
+            continue
+
         print("\n" + "=" * 60)
         print(f"Fold {fold_id}: train={len(tr_idx)}, val={len(va_idx)}")
         print("=" * 60)
@@ -471,7 +552,8 @@ def run_cv(args: argparse.Namespace) -> None:
 
         pred_mats = vectors_to_matrices(pred_vecs, cfg.n_hr, vectorizer)
         gt_mats = vectors_to_matrices(gt_vecs, cfg.n_hr, vectorizer)
-        metrics = evaluate_fold(pred_mats, gt_mats, verbose=True)
+        metric_cache = out_dir / f"fold_{fold_id}_metrics_cache.json"
+        metrics = evaluate_fold(pred_mats, gt_mats, verbose=True, cache_path=metric_cache)
 
         fold_metric_dicts.append(metrics)
         fold_records.append(
@@ -490,6 +572,12 @@ def run_cv(args: argparse.Namespace) -> None:
         now_ram = current_ram_gb()
         if np.isfinite(now_ram):
             peak_ram = np.nanmax([peak_ram, now_ram])
+
+        # Save fold-level progress for resume
+        write_json(progress_path, {
+            "fold_records": fold_records,
+            "completed_folds": sorted(r["fold"] for r in fold_records),
+        })
 
     total_seconds = float(time.perf_counter() - cv_start)
     mean_metrics, std_metrics = summarize_folds(fold_metric_dicts)
@@ -530,6 +618,7 @@ def run_cv(args: argparse.Namespace) -> None:
 def run_full(args: argparse.Namespace) -> None:
     args = apply_preset(args)
     cfg = TrainConfig(
+        model_name=args.model,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
@@ -542,6 +631,10 @@ def run_full(args: argparse.Namespace) -> None:
         huber_beta=args.huber_beta,
         l1_weight=args.l1_weight,
         seed=args.seed,
+        num_heads=args.num_heads,
+        ffn_mult=args.ffn_mult,
+        num_decoder_heads=args.num_decoder_heads,
+        hr_refine_layers=args.hr_refine_layers,
     )
 
     seed_everything(cfg.seed)

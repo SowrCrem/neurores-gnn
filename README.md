@@ -87,8 +87,8 @@ neurores-gnn/
 ### Phase 4 🔲 — Comparison models  `(spec §3.2B — 6 pts)`
 The spec requires benchmarking against **two** other methods using the same 3-fold CV split:
 - [x] **SGC baseline** — `models/sgc_baseline.py` — Simple Graph Convolution ([Tutorial 2](https://github.com/basiralab/DGL/tree/main/Tutorials/Tutorial-2), Wu et al. 2019)
-- [ ] **SOTA comparison** — one of 3 published brain graph super-resolution methods identified in the report (the `gcn-encoder-ca-decoder/` may qualify, or pick a paper)
-- [ ] Train both with 3-fold CV and evaluate on all 8 metrics for the comparison table
+- [x] **SOTA comparison** — one of 3 published brain graph super-resolution methods identified in the report (the `gcn-encoder-ca-decoder/` may qualify, or pick a paper)
+- [x] Train both with 3-fold CV and evaluate on all 8 metrics for the comparison table
 
 ### Phase 5 🔲 — Submission notebook  `(spec §3.1 — 20 pts)`
 - [ ] **`notebooks/main.ipynb`** — single-run notebook that generates **all** outputs:

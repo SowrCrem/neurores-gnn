@@ -191,6 +191,8 @@ IEEE Conference Paper template, max 5 pages + optional pipeline figure page.
     - `artifacts/dense_gcn_v3/full_retrain_summary.json`
     - `submission/dense_gcn_v3_full_retrain_submission.csv`
 
+    For **DenseGAT v4** with Optuna hyperparameter tuning, see [docs/HYPERPARAMETER_TUNING.md](docs/HYPERPARAMETER_TUNING.md).
+
 9. **Analyse and report from artifacts**:
     Open `notebooks/dense_gcn_analysis.ipynb`, set `ARTIFACT_DIR`, and run all cells to generate:
     - 8-metric fold plots,
@@ -231,6 +233,42 @@ Located in `gcn-encoder-ca-decoder/` — a self-contained reference implementati
 **Status:** Code complete but not yet trained — no logs or outputs produced.
 
 See [gcn-encoder-ca-decoder/README.md](gcn-encoder-ca-decoder/README.md) for detailed documentation.
+
+---
+
+## 📊 Baselines & Model Architectures (3-Fold CV on Kaggle Dataset)
+
+**Dataset:** DGL 2026 Brain Graph Super-Resolution — 167 train (LR 160×160 → HR 268×268), 112 test.
+
+| Model | Architecture | MAE ↓ | PCC ↑ | JSD ↓ | Status |
+|-------|---------------|-------|-------|-------|--------|
+| **SGC Baseline** | K-hop propagation (no learnable GCN), linear proj, bilinear decoder | 0.38* | 0.03* | — | High fold variance (Fold 2 collapsed) |
+| **DenseGCN v1** | 3× GCN blocks, 160-dim features, bilinear decoder | 0.242 | -0.014 | 0.59 | ✅ Best CV MAE (legacy) |
+| **DenseGCN v2** | Same, lower LR (5e-4), MSE loss | 0.239 | -0.024 | 0.59 | ✅ Baseline |
+| **DenseGCN v3** | 3× GCN, hidden=192, SmoothL1, dropout=0.35 | 0.242 ± 0.003 | -0.022 ± 0.007 | 0.593 | ✅ Balanced preset |
+| **DenseGAT v4** | 4× GAT blocks, HR refine, bilinear decoder | 0.260 | NaN | 0.356 | ⚠️ Val loss stuck (fixed in code) |
+| **DenseGAT v4 (fixed)** | Softplus decoder, P@P^T, lr=8e-4 | — | — | — | 🔄 Re-run after fix |
+| **GCN + Cross-Attn** | Dense GCN encoder, HR queries, cross-attention decoder | — | — | — | 🔲 Not trained |
+| **BrainGNN** | DGL GraphConvBlock, bilinear decoder | — | — | — | 🔲 Reference (src/train.py) |
+
+*SGC: Fold 1 MAE 0.234, Fold 2 MAE 0.642 (collapse), Fold 3 MAE 0.254.
+
+**Kaggle leaderboard:** Fill after submission. Primary metric = MAE on test set.
+
+### Architecture summary (for exploration)
+
+- **SGC:** No learnable message passing — `H = S^K X`, single linear. Fast but limited.
+- **DenseGCN:** Full adjacency rows as features, GCN blocks (S @ H @ W + ReLU + residual), learned upsample 160→268, bilinear `H W H^T`.
+- **DenseGAT:** GAT blocks (attention + adjacency bias), GELU, upsample, HR refine (self-attn), bilinear `H P P^T H^T` + softplus.
+- **GCN+Cross-Attn:** GCN encoder, learnable HR query embeddings, cross-attention to LR nodes, bilinear decoder.
+
+### Suggested next directions
+
+1. **Train GCN+Cross-Attn** — already implemented; HR queries may capture structure better than learned upsample.
+2. **DenseGAT v4 (fixed)** — run full CV after softplus decoder fix; val loss improved in quick test.
+3. **Hybrid GCN+GAT** — GCN for local structure, GAT for long-range; or GAT encoder with GCN decoder.
+4. **Decoder variants** — multi-head bilinear, graph attention over HR edges, or MLP over edge features.
+5. **SGC stability** — Fold 2 collapse suggests sensitivity; try different K, init, or regularization.
 
 ---
 

@@ -190,6 +190,8 @@ def evaluate_fold(
     ignore_diagonal: bool = True,
     verbose: bool = True,
     cache_path: str | Path | None = None,
+    skip_graph_metrics: bool = False,
+    max_samples: int | None = None,
 ) -> dict:
     """
     Evaluate a fold (or any batch) of predicted vs ground-truth adjacency matrices.
@@ -221,6 +223,13 @@ def evaluate_fold(
         construction (ignoring self-loops).
     verbose : bool, optional
         If True, print each metric value (simple logging).
+    skip_graph_metrics : bool, optional
+        If True, skip expensive graph-level metrics (PC, EC, BC, Strength, Clustering).
+        Use for quick sanity checks; MAE, PCC, JSD are still computed.
+    max_samples : int, optional
+        If set, compute graph metrics on only this many randomly sampled matrices
+        instead of all. Speeds up evaluation (~30 min -> ~3 min per fold for N=5).
+        Matrix-level metrics (MAE, PCC, JSD) always use all samples.
 
     Returns
     -------
@@ -270,23 +279,52 @@ def evaluate_fold(
     # -------------------------------------------------------------------------
     # 2) Graph-level metrics: compute node-measures per sample, then average MAE
     #    Supports incremental caching so the run can resume after interruption.
+    #    Skipped when skip_graph_metrics=True (for quick sanity checks).
     # -------------------------------------------------------------------------
     GRAPH_METRIC_KEYS = ["MAE (PC)", "MAE (EC)", "MAE (BC)", "MAE (Strength)", "MAE (Clustering)"]
 
+    if skip_graph_metrics:
+        out = {
+            "MAE": float(mae),
+            "PCC": float(pcc) if np.isfinite(pcc) else np.nan,
+            "JSD": float(jsd),
+            **{k: np.nan for k in GRAPH_METRIC_KEYS},
+        }
+        ordered_out = {k: out[k] for k in METRIC_ORDER}
+        if verbose:
+            print("Evaluation metrics (graph metrics skipped):")
+            for k in METRIC_ORDER:
+                v = ordered_out[k]
+                if isinstance(v, float) and np.isnan(v):
+                    print(f"  {k:16s}: (skipped)")
+                else:
+                    print(f"  {k:16s}: {v:.6f}" if isinstance(v, (float, np.floating)) else f"  {k:16s}: {v}")
+        return ordered_out
+
     cached_samples: list[dict] = []
-    if cache_path is not None:
+    n_samples = pred_mats.shape[0]
+    if max_samples is not None and max_samples < n_samples:
+        rng = np.random.default_rng(42)
+        sample_indices = sorted(rng.choice(n_samples, size=max_samples, replace=False))
+        use_cache = False  # no cache when subsampling
+    else:
+        sample_indices = list(range(n_samples))
+        use_cache = cache_path is not None
+
+    if use_cache:
         cache_path = Path(cache_path)
         if cache_path.exists():
             with open(cache_path, "r", encoding="utf-8") as _cf:
                 cached_samples = json.load(_cf)
             if verbose:
-                print(f"  Resuming graph metrics from cache ({len(cached_samples)}/{pred_mats.shape[0]} samples done)")
+                print(f"  Resuming graph metrics from cache ({len(cached_samples)}/{len(sample_indices)} samples done)")
 
-    n_samples = pred_mats.shape[0]
     start_idx = len(cached_samples)
+    n_to_process = len(sample_indices)
 
-    for i in tqdm(range(start_idx, n_samples), desc="Graph metrics", disable=not verbose,
-                  initial=start_idx, total=n_samples):
+    for idx in tqdm(range(start_idx, n_to_process), desc="Graph metrics", disable=not verbose,
+                    initial=start_idx, total=n_to_process):
+        i = sample_indices[idx]
         p = _mask_diagonal(pred_mats[i]) if ignore_diagonal else pred_mats[i]
         g = _mask_diagonal(gt_mats[i]) if ignore_diagonal else gt_mats[i]
 
@@ -316,7 +354,7 @@ def evaluate_fold(
             "MAE (Clustering)": float(_avg_node_mae(pred_clust, gt_clust)),
         })
 
-        if cache_path is not None:
+        if use_cache and cache_path is not None:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             with open(cache_path, "w", encoding="utf-8") as _cf:
                 json.dump(cached_samples, _cf)

@@ -79,7 +79,7 @@ class DenseGCNGenerator(nn.Module):
         self.upsample = nn.Linear(n_lr, n_hr)
 
         self.edge_W = nn.Parameter(torch.empty(hidden_dim, hidden_dim))
-        nn.init.xavier_uniform_(self.edge_W)
+        nn.init.xavier_uniform_(self.edge_W, gain=0.5)
 
         self._triu_idx = None
 
@@ -125,4 +125,4 @@ class DenseGCNGenerator(nn.Module):
 
         idx = self._get_triu_indices(A.device)
         pred = A[:, idx[0], idx[1]]                      # (B, 35778)
-        return torch.clamp(pred, min=0.0)
+        return torch.nn.functional.softplus(pred)  # non-negative + gradient flow

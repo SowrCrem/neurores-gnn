@@ -1,18 +1,17 @@
 """
 DenseGCN training/evaluation script for brain graph super-resolution.
 
-This script centralizes the experiment flow previously duplicated in notebooks:
   1) 3-fold cross-validation with full 8-metric evaluation
-  2) Resource tracking (total wall-clock time + peak RAM RSS)
-  3) Full-data retraining on train_LR/train_HR
+  2) Hyperparameter tuning (Optuna Bayesian optimization on 3-fold CV)
+  3) Full-data retraining on train_LR/train_HR (default 50 epochs)
   4) test_LR inference and Kaggle-format submission export
 
-Usage examples:
-    # 3-fold CV with metrics + resource logs
-    python -m src.train_dense_gcn cv
+Usage:
+    .venv/bin/python -m src.train_dense_gcn cv --preset v4 --fresh
+    .venv/bin/python -m src.train_dense_gcn tune --preset v4 --out-dir artifacts/dense_gat_v4_tune
+    .venv/bin/python -m src.train_dense_gcn full --preset v4 --max-epochs 50 --submission-path submission/dense_gat_v4_submission.csv
 
-    # Full retraining + submission generation
-    python -m src.train_dense_gcn full
+See docs/HYPERPARAMETER_TUNING.md for full tuning commands and workflow.
 """
 
 from __future__ import annotations
@@ -28,10 +27,15 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, train_test_split
 from torch.utils.data import DataLoader, TensorDataset
 
+from models.dense_bisr import DenseBiSRGenerator
+from models.dense_gin import DenseGINGenerator
 from models.dense_gcn import DenseGCNGenerator
+from models.dense_gcn_ca import DenseGCNCrossAttnGenerator
+from models.dense_gcn_gps import DenseGCNGPSGenerator
+from models.dense_graphsage import DenseGraphSAGEGenerator
 from models.dense_gat import DenseGATGenerator
 from utils.matrix_vectorizer import MatrixVectorizer
 from utils.metrics import METRIC_ORDER, evaluate_fold
@@ -41,6 +45,11 @@ try:
     import psutil
 except ImportError:
     psutil = None
+
+try:
+    import optuna
+except ImportError:
+    optuna = None
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +87,9 @@ class TrainConfig:
     ffn_mult: int = 4
     num_decoder_heads: int = 4
     hr_refine_layers: int = 1
+    edge_scale: float = 0.2
+    bipartite_layers: int = 1  # Bi-SR only
+    max_epochs_full: int = 50  # cap for full retrain (CV guides best; 50 ≈ convergence)
 
 
 def parse_args() -> argparse.Namespace:
@@ -89,8 +101,8 @@ def parse_args() -> argparse.Namespace:
     def add_shared(p: argparse.ArgumentParser) -> None:
         p.add_argument("--data-dir", type=str, default=DEFAULT_DATA_DIR)
         p.add_argument("--out-dir", type=str, default=DEFAULT_OUT_DIR)
-        p.add_argument("--preset", type=str, default="v2", choices=["v2", "v3", "v4"])
-        p.add_argument("--model", type=str, default="dense_gcn", choices=["dense_gcn", "dense_gat"])
+        p.add_argument("--preset", type=str, default="v2", choices=["v2", "v3", "v4", "v5", "bisr", "bisr_v2", "gcn_ca", "gin", "gps", "graphsage"])
+        p.add_argument("--model", type=str, default="dense_gcn", choices=["dense_gcn", "dense_gat", "dense_bisr", "dense_gcn_ca", "dense_gin", "dense_gcn_gps", "dense_graphsage"])
         p.add_argument("--seed", type=int, default=42)
         p.add_argument("--epochs", type=int, default=400)
         p.add_argument("--patience", type=int, default=30)
@@ -115,15 +127,51 @@ def parse_args() -> argparse.Namespace:
         p.add_argument("--ffn-mult", type=int, default=4)
         p.add_argument("--num-decoder-heads", type=int, default=4)
         p.add_argument("--hr-refine-layers", type=int, default=1)
+        p.add_argument("--edge-scale", type=float, default=0.2, help="GAT: adjacency bias strength (0.1=weak, 0.5=strong)")
+        p.add_argument("--bipartite-layers", type=int, default=1, help="Bi-SR: number of bipartite GNN layers (1-2)")
 
     cv = sub.add_parser("cv", help="Run 3-fold CV and log metrics/resources.")
     add_shared(cv)
     cv.add_argument("--num-folds", type=int, default=3)
+    cv.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Clear CV progress, fold checkpoints, and metrics cache; run all folds from scratch.",
+    )
+    cv.add_argument(
+        "--skip-graph-metrics",
+        action="store_true",
+        help="Skip expensive graph metrics (PC, EC, BC, etc.); only compute MAE, PCC, JSD. Use for quick sanity checks.",
+    )
+    cv.add_argument(
+        "--graph-metrics-subsample",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Compute graph metrics on N random val samples (e.g. 5) instead of all. Speeds up evaluation (~30 min -> ~3 min per fold).",
+    )
 
     full = sub.add_parser("full", help="Retrain on full train set and predict test set.")
     add_shared(full)
     full.add_argument("--submission-path", type=str, default=DEFAULT_SUBMISSION_PATH)
     full.add_argument("--checkpoint-name", type=str, default="full_model.pt")
+    full.add_argument("--max-epochs", type=int, default=400, help="Max epochs for full retrain (default 400)")
+    full.add_argument("--val-ratio", type=float, default=0.15, help="Hold out this fraction for validation and early stopping (0 = no val, train on all)")
+    full.add_argument(
+        "--ensemble-seeds",
+        type=str,
+        default=None,
+        help="Comma-separated seeds for full-retrain ensemble (e.g. 42,43,44). Each model trained on all 167; predictions averaged.",
+    )
+
+    tune = sub.add_parser("tune", help="Hyperparameter tuning: Optuna Bayesian optimization on 3-fold CV.")
+    add_shared(tune)
+    tune.add_argument("--num-folds", type=int, default=3)
+    tune.add_argument("--n-trials", type=int, default=20, help="Number of Optuna trials (default 20)")
+    tune.add_argument("--out-config", type=str, default=None, help="Path to save best config JSON for full retrain")
+    tune.add_argument("--fresh", action="store_true", help="Clear Optuna study and start from scratch")
+    tune.add_argument("--full-retrain", action="store_true", help="After tuning, run full retrain with best config and save submission")
+    tune.add_argument("--submission-path", type=str, default=None, help="Submission CSV path (used with --full-retrain; default: out-dir/submission.csv)")
 
     return parser.parse_args()
 
@@ -183,6 +231,50 @@ def build_model(cfg: TrainConfig, device: torch.device) -> nn.Module:
             ffn_mult=cfg.ffn_mult,
             num_decoder_heads=cfg.num_decoder_heads,
             hr_refine_layers=cfg.hr_refine_layers,
+            edge_scale=cfg.edge_scale,
+        ).to(device)
+    if cfg.model_name == "dense_bisr":
+        return DenseBiSRGenerator(
+            n_lr=cfg.n_lr,
+            n_hr=cfg.n_hr,
+            hidden_dim=cfg.hidden_dim,
+            num_layers=cfg.num_layers,
+            bipartite_layers=cfg.bipartite_layers,
+            dropout=cfg.dropout,
+        ).to(device)
+    if cfg.model_name == "dense_gcn_ca":
+        return DenseGCNCrossAttnGenerator(
+            n_lr=cfg.n_lr,
+            n_hr=cfg.n_hr,
+            hidden_dim=cfg.hidden_dim,
+            num_layers=cfg.num_layers,
+            num_heads=cfg.num_heads,
+            dropout=cfg.dropout,
+        ).to(device)
+    if cfg.model_name == "dense_gin":
+        return DenseGINGenerator(
+            n_lr=cfg.n_lr,
+            n_hr=cfg.n_hr,
+            hidden_dim=cfg.hidden_dim,
+            num_layers=cfg.num_layers,
+            dropout=cfg.dropout,
+        ).to(device)
+    if cfg.model_name == "dense_gcn_gps":
+        return DenseGCNGPSGenerator(
+            n_lr=cfg.n_lr,
+            n_hr=cfg.n_hr,
+            hidden_dim=cfg.hidden_dim,
+            num_layers=cfg.num_layers,
+            num_heads=cfg.num_heads,
+            dropout=cfg.dropout,
+        ).to(device)
+    if cfg.model_name == "dense_graphsage":
+        return DenseGraphSAGEGenerator(
+            n_lr=cfg.n_lr,
+            n_hr=cfg.n_hr,
+            hidden_dim=cfg.hidden_dim,
+            num_layers=cfg.num_layers,
+            dropout=cfg.dropout,
         ).to(device)
     return DenseGCNGenerator(
         n_lr=cfg.n_lr,
@@ -216,6 +308,7 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
             "ffn_mult": 4,
             "num_decoder_heads": 4,
             "hr_refine_layers": 1,
+            "edge_scale": 0.2,
         },
         "v3": {
             "model": "dense_gcn",
@@ -231,13 +324,63 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
             "ffn_mult": 4,
             "num_decoder_heads": 4,
             "hr_refine_layers": 1,
+            "edge_scale": 0.2,
         },
         "v4": {
             "model": "dense_gat",
             "hidden_dim": 192,
             "num_layers": 4,
-            "dropout": 0.25,
+            "dropout": 0.2,   # more reg than 0.1
+            "lr": 8e-4,
+            "patience": 50,
+            "loss": "smoothl1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 0,  # drop HR refine (no structure; overfits)
+            "edge_scale": 0.3,     # stronger graph bias (was 0.1)
+        },
+        "v5": {
+            "model": "dense_gat",
+            "hidden_dim": 128,
+            "num_layers": 3,
+            "dropout": 0.4,
             "lr": 5e-4,
+            "patience": 45,
+            "loss": "smoothl1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 2,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 0,
+            "edge_scale": 0.7,
+        },
+        "gcn_ca": {
+            "model": "dense_gcn_ca",
+            "hidden_dim": 128,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 5e-4,
+            "patience": 45,
+            "loss": "smoothl1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 0,
+            "edge_scale": 0.2,
+        },
+        "bisr": {
+            "model": "dense_bisr",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "bipartite_layers": 1,
+            "dropout": 0.3,
+            "lr": 8e-4,
             "patience": 50,
             "loss": "smoothl1",
             "l1_weight": 0.7,
@@ -246,6 +389,72 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
             "ffn_mult": 4,
             "num_decoder_heads": 4,
             "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+        },
+        "bisr_v2": {
+            "model": "dense_bisr",
+            "hidden_dim": 128,
+            "num_layers": 3,
+            "bipartite_layers": 1,
+            "dropout": 0.4,
+            "lr": 5e-4,
+            "patience": 40,
+            "loss": "smoothl1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+        },
+        "gin": {
+            "model": "dense_gin",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 45,
+            "loss": "smoothl1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+        },
+        "gps": {
+            "model": "dense_gcn_gps",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 45,
+            "loss": "smoothl1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+        },
+        "graphsage": {
+            "model": "dense_graphsage",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 45,
+            "loss": "smoothl1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
         },
     }
     chosen = preset_map[args.preset]
@@ -274,6 +483,8 @@ def parse_args_defaults() -> dict:
         "ffn_mult": 4,
         "num_decoder_heads": 4,
         "hr_refine_layers": 1,
+        "edge_scale": 0.2,
+        "bipartite_layers": 1,
     }
 
 
@@ -312,6 +523,9 @@ def train_with_validation(
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
     )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=15, min_lr=1e-6
+    )
     base_loss_fn = build_loss(cfg)
 
     best_val = float("inf")
@@ -321,6 +535,7 @@ def train_with_validation(
 
     for epoch in range(1, cfg.epochs + 1):
         model.train()
+        train_losses_epoch = []
         for x_vec, y_vec in tr_loader:
             a = vec_to_adj(x_vec, cfg.n_lr, vectorizer)
             pred = model(a, a)
@@ -329,11 +544,12 @@ def train_with_validation(
                     (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
             else:
                 loss = base_loss_fn(pred, y_vec)
+            train_losses_epoch.append(loss.item())
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            if cfg.model_name == "dense_gat":
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if cfg.model_name in ("dense_gat", "dense_bisr", "dense_gcn_ca", "dense_gin", "dense_gcn_gps", "dense_graphsage"):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
 
         model.eval()
@@ -350,6 +566,7 @@ def train_with_validation(
                 val_losses.append(val_loss.item())
 
         val_loss = float(np.mean(val_losses))
+        scheduler.step(val_loss)
         improved = val_loss < best_val
         if improved:
             best_val = val_loss
@@ -361,7 +578,11 @@ def train_with_validation(
 
         if epoch % 10 == 0 or epoch == 1:
             marker = " *" if improved else ""
-            print(f"  Fold {fold_id} | Epoch {epoch:3d}/{cfg.epochs} | Val: {val_loss:.6f}{marker}")
+            mean_tr = np.mean(train_losses_epoch)
+            if cfg.model_name in ("dense_gat", "dense_bisr", "dense_gcn_ca", "dense_gin", "dense_gcn_gps", "dense_graphsage"):
+                print(f"  Fold {fold_id} | Epoch {epoch:3d}/{cfg.epochs} | Train: {mean_tr:.6f} | Val: {val_loss:.6f}{marker}")
+            else:
+                print(f"  Fold {fold_id} | Epoch {epoch:3d}/{cfg.epochs} | Val: {val_loss:.6f}{marker}")
 
         if stale_epochs >= cfg.patience:
             print(
@@ -384,21 +605,40 @@ def train_full(
     vectorizer: MatrixVectorizer,
     x_tr: np.ndarray,
     y_tr: np.ndarray,
+    max_epochs: int | None = None,
+    x_va: np.ndarray | None = None,
+    y_va: np.ndarray | None = None,
+    patience: int | None = None,
 ) -> DenseGCNGenerator:
+    """Full retrain. If x_va/y_va provided, use early stopping; else run for max_epochs."""
+    epochs = max_epochs if max_epochs is not None else cfg.max_epochs_full
     xtr = torch.from_numpy(x_tr).float().to(device)
     ytr = torch.from_numpy(y_tr).float().to(device)
-    loader = DataLoader(TensorDataset(xtr, ytr), batch_size=cfg.batch_size, shuffle=True)
+    tr_loader = DataLoader(TensorDataset(xtr, ytr), batch_size=cfg.batch_size, shuffle=True)
 
     model = build_model(cfg, device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
     )
     base_loss_fn = build_loss(cfg)
+    if cfg.model_name in ("dense_gat", "dense_bisr", "dense_gcn_ca", "dense_gin", "dense_gcn_gps", "dense_graphsage"):
+        grad_clip = lambda: torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+    else:
+        grad_clip = lambda: None
 
-    for epoch in range(1, cfg.epochs + 1):
+    use_early_stop = x_va is not None and y_va is not None and patience is not None
+    if use_early_stop:
+        xva = torch.from_numpy(x_va).float().to(device)
+        yva = torch.from_numpy(y_va).float().to(device)
+        va_loader = DataLoader(TensorDataset(xva, yva), batch_size=cfg.batch_size, shuffle=False)
+    best_val = float("inf")
+    best_state = None
+    stale_epochs = 0
+
+    for epoch in range(1, epochs + 1):
         model.train()
         train_losses = []
-        for x_vec, y_vec in loader:
+        for x_vec, y_vec in tr_loader:
             a = vec_to_adj(x_vec, cfg.n_lr, vectorizer)
             pred = model(a, a)
             if cfg.loss_name == "hybrid":
@@ -406,15 +646,44 @@ def train_full(
                     (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
             else:
                 loss = base_loss_fn(pred, y_vec)
-
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            grad_clip()
             optimizer.step()
             train_losses.append(loss.item())
 
-        if epoch % 10 == 0 or epoch == 1 or epoch == cfg.epochs:
-            print(f"  Full-train | Epoch {epoch:3d}/{cfg.epochs} | Loss: {np.mean(train_losses):.6f}")
+        if use_early_stop:
+            model.eval()
+            val_losses = []
+            with torch.no_grad():
+                for x_vec, y_vec in va_loader:
+                    a = vec_to_adj(x_vec, cfg.n_lr, vectorizer)
+                    pred = model(a, a)
+                    if cfg.loss_name == "hybrid":
+                        v = cfg.l1_weight * nn.functional.l1_loss(pred, y_vec) + (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
+                    else:
+                        v = base_loss_fn(pred, y_vec)
+                    val_losses.append(v.item())
+            val_loss = float(np.mean(val_losses))
+            if val_loss < best_val:
+                best_val = val_loss
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+            if epoch % 10 == 0 or epoch == 1:
+                print(f"  Full-train | Epoch {epoch:3d}/{epochs} | Train: {np.mean(train_losses):.6f} | Val: {val_loss:.6f}")
+            if stale_epochs >= patience:
+                print(f"  Early stopping at epoch {epoch} (no val improvement for {patience} epochs)")
+                if best_state is not None:
+                    model.load_state_dict(best_state)
+                return model
+        else:
+            if epoch % 10 == 0 or epoch == 1 or epoch == epochs:
+                print(f"  Full-train | Epoch {epoch:3d}/{epochs} | Loss: {np.mean(train_losses):.6f}")
 
+    if use_early_stop and best_state is not None:
+        model.load_state_dict(best_state)
     return model
 
 
@@ -471,6 +740,8 @@ def run_cv(args: argparse.Namespace) -> None:
         ffn_mult=args.ffn_mult,
         num_decoder_heads=args.num_decoder_heads,
         hr_refine_layers=args.hr_refine_layers,
+        edge_scale=getattr(args, "edge_scale", 0.2),
+        bipartite_layers=getattr(args, "bipartite_layers", 1),
     )
 
     seed_everything(cfg.seed)
@@ -489,8 +760,19 @@ def run_cv(args: argparse.Namespace) -> None:
     vectorizer = MatrixVectorizer()
     kf = KFold(n_splits=cfg.num_folds, shuffle=True, random_state=cfg.seed)
 
-    # --- Fold-level resume: load progress from previous interrupted run ---
     progress_path = out_dir / "cv_progress.json"
+
+    # --- --fresh: clear CV progress, checkpoints, and metrics cache ---
+    if getattr(args, "fresh", False):
+        if progress_path.exists():
+            progress_path.unlink()
+        for p in ckpt_dir.glob("fold_*.pt"):
+            p.unlink()
+        for p in out_dir.glob("fold_*_metrics_cache.json"):
+            p.unlink()
+        print("Fresh run: cleared CV progress, checkpoints, and metrics cache.")
+
+    # --- Fold-level resume: load progress from previous interrupted run ---
     fold_records: list[dict] = []
     fold_metric_dicts: list[dict] = []
     fold_seconds: list[float] = []
@@ -516,6 +798,12 @@ def run_cv(args: argparse.Namespace) -> None:
         print("\n" + "=" * 60)
         print(f"Fold {fold_id}: train={len(tr_idx)}, val={len(va_idx)}")
         print("=" * 60)
+
+        # Clear metrics cache for this fold so we recompute for this run's predictions
+        # (cache is keyed only by fold + sample count; reuse would show stale graph metrics)
+        metric_cache = out_dir / f"fold_{fold_id}_metrics_cache.json"
+        if metric_cache.exists():
+            metric_cache.unlink()
 
         fold_t0 = time.perf_counter()
         model, best_val, best_epoch = train_with_validation(
@@ -552,8 +840,13 @@ def run_cv(args: argparse.Namespace) -> None:
 
         pred_mats = vectors_to_matrices(pred_vecs, cfg.n_hr, vectorizer)
         gt_mats = vectors_to_matrices(gt_vecs, cfg.n_hr, vectorizer)
-        metric_cache = out_dir / f"fold_{fold_id}_metrics_cache.json"
-        metrics = evaluate_fold(pred_mats, gt_mats, verbose=True, cache_path=metric_cache)
+        subsample = getattr(args, "graph_metrics_subsample", None)
+        metric_cache = None if (getattr(args, "skip_graph_metrics", False) or subsample is not None) else (out_dir / f"fold_{fold_id}_metrics_cache.json")
+        metrics = evaluate_fold(
+            pred_mats, gt_mats, verbose=True, cache_path=metric_cache,
+            skip_graph_metrics=getattr(args, "skip_graph_metrics", False),
+            max_samples=subsample,
+        )
 
         fold_metric_dicts.append(metrics)
         fold_records.append(
@@ -617,6 +910,9 @@ def run_cv(args: argparse.Namespace) -> None:
 
 def run_full(args: argparse.Namespace) -> None:
     args = apply_preset(args)
+    ensemble_seeds_str = getattr(args, "ensemble_seeds", None)
+    seeds = [int(s.strip()) for s in ensemble_seeds_str.split(",")] if ensemble_seeds_str else [args.seed]
+
     cfg = TrainConfig(
         model_name=args.model,
         hidden_dim=args.hidden_dim,
@@ -630,14 +926,16 @@ def run_full(args: argparse.Namespace) -> None:
         loss_name=args.loss,
         huber_beta=args.huber_beta,
         l1_weight=args.l1_weight,
-        seed=args.seed,
+        seed=seeds[0],
+        num_folds=getattr(args, "num_folds", 3),
         num_heads=args.num_heads,
         ffn_mult=args.ffn_mult,
         num_decoder_heads=args.num_decoder_heads,
         hr_refine_layers=args.hr_refine_layers,
+        edge_scale=getattr(args, "edge_scale", 0.2),
+        bipartite_layers=getattr(args, "bipartite_layers", 1),
     )
 
-    seed_everything(cfg.seed)
     device = get_device(args.device)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -649,26 +947,57 @@ def run_full(args: argparse.Namespace) -> None:
     print(f"Device: {device}")
     print(f"Train LR: {x_train.shape} | Train HR: {y_train.shape} | Test LR: {x_test.shape}")
     print(f"Config: {asdict(cfg)}")
+    if len(seeds) > 1:
+        print(f"Ensemble mode: {len(seeds)} seeds {seeds}")
 
     vectorizer = MatrixVectorizer()
     peak_ram = current_ram_gb()
     train_start = time.perf_counter()
-    full_model = train_full(cfg, device, vectorizer, x_train, y_train)
-    train_seconds = float(time.perf_counter() - train_start)
+    max_epochs = getattr(args, "max_epochs", 400)
+    val_ratio = getattr(args, "val_ratio", 0.15)
+    patience = getattr(args, "patience", 50)
 
-    checkpoint_path = out_dir / "checkpoints" / args.checkpoint_name
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model": full_model.state_dict(), "config": asdict(cfg)}, checkpoint_path)
+    preds_list = []
+    total_train_seconds = 0.0
 
-    preds = predict_vectors(full_model, x_test, device, vectorizer, cfg.batch_size, cfg.n_lr)
-    preds = np.clip(preds, a_min=0.0, a_max=None)
+    for i, seed in enumerate(seeds):
+        cfg.seed = seed
+        seed_everything(seed)
+        if len(seeds) > 1:
+            print(f"\n--- Ensemble seed {i+1}/{len(seeds)}: {seed} ---")
+
+        x_tr, y_tr = x_train, y_train
+        x_va, y_va = None, None
+        if val_ratio > 0 and val_ratio < 1:
+            x_tr, x_va, y_tr, y_va = train_test_split(
+                x_train, y_train, test_size=val_ratio, random_state=seed, shuffle=True
+            )
+            if i == 0:
+                print(f"Full retrain: train {x_tr.shape[0]}, val {x_va.shape[0]} (early stopping patience={patience})")
+
+        fold_train_start = time.perf_counter()
+        full_model = train_full(
+            cfg, device, vectorizer, x_tr, y_tr,
+            max_epochs=max_epochs, x_va=x_va, y_va=y_va, patience=patience if (x_va is not None) else None,
+        )
+        total_train_seconds += time.perf_counter() - fold_train_start
+
+        checkpoint_path = out_dir / "checkpoints" / (f"full_model_seed{seed}.pt" if len(seeds) > 1 else args.checkpoint_name)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"model": full_model.state_dict(), "config": asdict(cfg)}, checkpoint_path)
+
+        preds = predict_vectors(full_model, x_test, device, vectorizer, cfg.batch_size, cfg.n_lr)
+        preds = np.clip(preds, a_min=0.0, a_max=None)
+        preds_list.append(preds)
+
+    preds = np.mean(preds_list, axis=0)
+    preds = np.clip(preds, a_min=0.0, a_max=1.0)
     assert preds.shape[1] == HR_FEATURES, f"Expected {HR_FEATURES} HR features, got {preds.shape[1]}"
 
     n_subjects, n_features = preds.shape
     ids = np.arange(1, n_subjects * n_features + 1)
     submission = np.column_stack([ids, preds.reshape(-1)])
 
-    # Save CSV without pandas to keep dependencies minimal.
     np.savetxt(
         submission_path,
         submission,
@@ -686,11 +1015,11 @@ def run_full(args: argparse.Namespace) -> None:
         "task": f"dense_gcn_{args.preset}_full_retrain",
         "device": str(device),
         "config": asdict(cfg),
-        "train_seconds": train_seconds,
-        "train_minutes": train_seconds / 60.0,
+        "ensemble_seeds": seeds if len(seeds) > 1 else None,
+        "train_seconds": total_train_seconds,
+        "train_minutes": total_train_seconds / 60.0,
         "peak_ram_gb_rss": None if not np.isfinite(peak_ram) else float(peak_ram),
         "psutil_available": psutil is not None,
-        "checkpoint_path": str(checkpoint_path),
         "submission_path": str(submission_path),
         "submission_rows": int(n_subjects * n_features),
     }
@@ -698,14 +1027,190 @@ def run_full(args: argparse.Namespace) -> None:
 
     print("\n" + "=" * 60)
     print("Full retraining completed.")
-    print(f"Checkpoint: {checkpoint_path}")
+    if len(seeds) > 1:
+        print(f"Ensemble: {len(seeds)} models (seeds {seeds})")
     print(f"Submission: {submission_path} ({n_subjects*n_features:,} rows)")
-    print(f"Train time: {train_seconds:.1f}s ({train_seconds/60.0:.2f} min)")
+    print(f"Train time: {total_train_seconds:.1f}s ({total_train_seconds/60.0:.2f} min)")
     if np.isfinite(peak_ram):
         print(f"Peak RAM RSS: {peak_ram:.3f} GB")
     else:
         print("Peak RAM RSS: N/A (install psutil to enable RAM tracking)")
     print(f"Saved: {out_dir / 'full_retrain_summary.json'}")
+
+
+def run_tune(args: argparse.Namespace) -> None:
+    """Optuna Bayesian optimization over DenseGAT hyperparams on 3-fold CV. Resumable via SQLite."""
+    if optuna is None:
+        raise ImportError("Optuna is required for tune mode. Install with: pip install optuna")
+
+    args = apply_preset(args)
+    if args.model != "dense_gat":
+        print("Tune mode is for dense_gat. Use --preset v4 or --model dense_gat.")
+        args.model = "dense_gat"
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    storage_path = out_dir / "optuna_study.db"
+    storage_url = f"sqlite:///{storage_path}"
+    n_trials = getattr(args, "n_trials", 20)
+    fresh = getattr(args, "fresh", False)
+
+    seed_everything(args.seed)
+    device = get_device(args.device)
+    data_dir = Path(args.data_dir)
+    x_train, y_train, _ = load_data(data_dir)
+    vectorizer = MatrixVectorizer()
+    kf = KFold(n_splits=args.num_folds, shuffle=True, random_state=args.seed)
+
+    def objective(trial: "optuna.Trial") -> float:
+        edge_scale = trial.suggest_float("edge_scale", 0.1, 0.5)
+        hr_refine_layers = trial.suggest_int("hr_refine_layers", 0, 1)
+        dropout = trial.suggest_float("dropout", 0.1, 0.4)
+        lr = trial.suggest_float("lr", 5e-4, 1.5e-3, log=True)
+        hidden_dim = trial.suggest_categorical("hidden_dim", [128, 192])
+        num_layers = trial.suggest_int("num_layers", 3, 4)
+
+        cfg = TrainConfig(
+            model_name="dense_gat",
+            n_lr=N_LR,
+            n_hr=N_HR,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            epochs=args.epochs,
+            patience=args.patience,
+            batch_size=args.batch_size,
+            learning_rate=lr,
+            weight_decay=args.weight_decay,
+            loss_name=args.loss,
+            huber_beta=args.huber_beta,
+            l1_weight=args.l1_weight,
+            seed=args.seed,
+            num_folds=args.num_folds,
+            num_heads=args.num_heads,
+            ffn_mult=args.ffn_mult,
+            num_decoder_heads=4,
+            hr_refine_layers=hr_refine_layers,
+            edge_scale=edge_scale,
+        )
+        fold_vals = []
+        for fold_id, (tr_idx, va_idx) in enumerate(kf.split(x_train), start=1):
+            _, best_val, _ = train_with_validation(
+                cfg, device, vectorizer,
+                x_train[tr_idx], y_train[tr_idx],
+                x_train[va_idx], y_train[va_idx],
+                fold_id,
+            )
+            fold_vals.append(best_val)
+        mean_val = float(np.mean(fold_vals))
+        trial.set_user_attr("fold_vals", fold_vals)
+        return mean_val
+
+    if fresh and storage_path.exists():
+        storage_path.unlink()
+        print("Fresh run: cleared Optuna study.")
+
+    study = optuna.create_study(
+        direction="minimize",
+        storage=storage_url,
+        load_if_exists=not fresh,
+        study_name="dense_gat_tune",
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    best_params = study.best_params
+    best_mean_val = study.best_value
+    best_config = {
+        "model_name": "dense_gat",
+        "n_lr": N_LR,
+        "n_hr": N_HR,
+        "hidden_dim": best_params["hidden_dim"],
+        "num_layers": best_params["num_layers"],
+        "dropout": best_params["dropout"],
+        "learning_rate": best_params["lr"],
+        "edge_scale": best_params["edge_scale"],
+        "hr_refine_layers": best_params["hr_refine_layers"],
+    }
+    all_results = [
+        {"params": t.params, "value": t.value}
+        for t in study.trials
+        if t.value is not None
+    ]
+
+    out_config_path = getattr(args, "out_config", None)
+    if out_config_path is None:
+        out_config_path = out_dir / "best_tune_config.json"
+    else:
+        out_config_path = Path(out_config_path)
+
+    write_json(out_config_path, {
+        "best_mean_val_loss": best_mean_val,
+        "config": best_config,
+        "best_params": best_params,
+        "all_results": all_results,
+    })
+    print(f"\nBest config saved to {out_config_path}")
+    print(f"Best mean val loss: {best_mean_val:.6f}")
+    print(f"Best params: {best_params}")
+
+    if getattr(args, "full_retrain", False):
+        submission_path = getattr(args, "submission_path", None) or str(out_dir / "submission.csv")
+        submission_path = Path(submission_path)
+        submission_path.parent.mkdir(parents=True, exist_ok=True)
+        val_ratio = 0.15
+        patience_full = 50
+        max_epochs_full = 400
+        print(f"\n--full-retrain: running full retrain with best config (val_ratio={val_ratio}, patience={patience_full}, max_epochs={max_epochs_full}) -> {submission_path}")
+        cfg = TrainConfig(
+            model_name="dense_gat",
+            n_lr=N_LR,
+            n_hr=N_HR,
+            hidden_dim=best_params["hidden_dim"],
+            num_layers=best_params["num_layers"],
+            dropout=best_params["dropout"],
+            epochs=args.epochs,
+            patience=args.patience,
+            batch_size=args.batch_size,
+            learning_rate=best_params["lr"],
+            weight_decay=args.weight_decay,
+            loss_name=args.loss,
+            huber_beta=args.huber_beta,
+            l1_weight=args.l1_weight,
+            seed=args.seed,
+            num_folds=args.num_folds,
+            num_heads=args.num_heads,
+            ffn_mult=args.ffn_mult,
+            num_decoder_heads=4,
+            hr_refine_layers=best_params["hr_refine_layers"],
+            edge_scale=best_params["edge_scale"],
+        )
+        x_train, y_train, x_test = load_data(data_dir)
+        x_tr, x_va, y_tr, y_va = train_test_split(
+            x_train, y_train, test_size=val_ratio, random_state=cfg.seed, shuffle=True
+        )
+        full_model = train_full(
+            cfg, device, vectorizer, x_tr, y_tr,
+            max_epochs=max_epochs_full, x_va=x_va, y_va=y_va, patience=patience_full,
+        )
+        ckpt_path = out_dir / "checkpoints" / "full_model_best_tune.pt"
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"model": full_model.state_dict(), "config": asdict(cfg)}, ckpt_path)
+        preds = predict_vectors(full_model, x_test, device, vectorizer, cfg.batch_size, cfg.n_lr)
+        preds = np.clip(preds, a_min=0.0, a_max=None)
+        assert preds.shape[1] == HR_FEATURES, f"Expected {HR_FEATURES} HR features, got {preds.shape[1]}"
+        n_subjects, n_features = preds.shape
+        ids = np.arange(1, n_subjects * n_features + 1)
+        submission = np.column_stack([ids, preds.reshape(-1)])
+        np.savetxt(submission_path, submission, delimiter=",", header="ID,Predicted", comments="", fmt=["%d", "%.10f"])
+        print(f"Full retrain done. Submission: {submission_path}")
+    else:
+        print(f"Run full retrain with:")
+        print(f"  .venv/bin/python -m src.train_dense_gcn full --preset v4 --max-epochs 400 --val-ratio 0.15 --patience 50 \\")
+        print(f"    --edge-scale {best_params['edge_scale']} --hr-refine-layers {best_params['hr_refine_layers']} \\")
+        print(f"    --dropout {best_params['dropout']} --lr {best_params['lr']} \\")
+        print(f"    --hidden-dim {best_params['hidden_dim']} --num-layers {best_params['num_layers']} \\")
+        print(f"    --submission-path submission/dense_gat_v4_submission.csv")
+        print(f"Or re-run tune with --full-retrain to do it automatically.")
 
 
 def main() -> None:
@@ -714,6 +1219,8 @@ def main() -> None:
         run_cv(args)
     elif args.mode == "full":
         run_full(args)
+    elif args.mode == "tune":
+        run_tune(args)
     else:
         raise ValueError(f"Unsupported mode: {args.mode}")
 

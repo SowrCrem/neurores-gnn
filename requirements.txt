@@ -15,5 +15,8 @@ pyyaml
 tqdm
 psutil
 
+# Hyperparameter tuning
+optuna
+
 # Visualisation
 matplotlib

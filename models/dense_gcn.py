@@ -69,6 +69,7 @@ class DenseGCNGenerator(nn.Module):
         self.raw_output = raw_output
         self.lap_pe_dim = lap_pe_dim
         self.pearl_pe_dim = pearl_pe_dim
+        self.edge_bias = nn.Parameter(torch.zeros(self.n_hr * (self.n_hr - 1) // 2))
 
         input_dim = n_lr + lap_pe_dim + pearl_pe_dim  # adjacency rows + optional Laplacian PE + PEARL PE
         
@@ -148,5 +149,6 @@ class DenseGCNGenerator(nn.Module):
         idx = self._get_triu_indices(A.device)
         pred = A[:, idx[0], idx[1]]                      # (B, 35778)
         if self.raw_output:
+            pred = pred + self.edge_bias.unsqueeze(0)
             return pred  # residual mode: caller adds y_mean back; can be negative
         return torch.nn.functional.softplus(pred)  # non-negative + gradient flow

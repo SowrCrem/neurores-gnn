@@ -113,7 +113,7 @@ def parse_args() -> argparse.Namespace:
     def add_shared(p: argparse.ArgumentParser) -> None:
         p.add_argument("--data-dir", type=str, default=DEFAULT_DATA_DIR)
         p.add_argument("--out-dir", type=str, default=DEFAULT_OUT_DIR)
-        p.add_argument("--preset", type=str, default="v2", choices=["v2", "v3", "v3r", "v3sn", "v3r_pe", "v3r_lrs", "v3r_cos", "v4", "v5", "bisr", "bisr_v2", "gcn_ca", "gin", "gin_n", "gin_v3r", "gps", "gps_v3r", "graphsage", "sage_v3r", "stp", "stp_pe"])
+        p.add_argument("--preset", type=str, default="v2", choices=["v2", "v3", "v3r", "v3sn", "v3r_pe", "v3r_lrs", "v3r_cos", "v4", "v5", "bisr", "bisr_v2", "bisr_v3r", "gcn_ca", "gin", "gin_n", "gin_v3r", "gps", "gps_v3r", "graphsage", "sage_v3r", "stp", "stp_pe"])
         p.add_argument("--model", type=str, default="dense_gcn", choices=["dense_gcn", "dense_gat", "dense_bisr", "dense_gcn_ca", "dense_gin", "dense_gcn_gps", "dense_gcn_lrs", "dense_graphsage", "dense_stp"])
         p.add_argument("--seed", type=int, default=42)
         p.add_argument("--epochs", type=int, default=400)
@@ -275,6 +275,7 @@ def build_model(cfg: TrainConfig, device: torch.device) -> nn.Module:
             num_layers=cfg.num_layers,
             bipartite_layers=cfg.bipartite_layers,
             dropout=cfg.dropout,
+            raw_output=cfg.use_residual,
         ).to(device)
     if cfg.model_name == "dense_gcn_ca":
         return DenseGCNCrossAttnGenerator(
@@ -467,6 +468,26 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
             "num_decoder_heads": 4,
             "hr_refine_layers": 1,
             "edge_scale": 0.2,
+        },
+        # bisr_v3r = Bi-SR + v3r training (L1, residual, mixup) — transfers from GIN v3r success
+        "bisr_v3r": {
+            "model": "dense_bisr",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "bipartite_layers": 1,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 60,
+            "loss": "l1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "use_residual": True,
+            "mixup_alpha": 0.2,
         },
         "gin": {
             "model": "dense_gin",

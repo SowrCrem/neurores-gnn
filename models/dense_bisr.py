@@ -58,11 +58,13 @@ class DenseBiSRGenerator(nn.Module):
         num_layers: int = 3,
         bipartite_layers: int = 1,
         dropout: float = 0.3,
+        raw_output: bool = False,
     ):
         super().__init__()
         self.n_lr = n_lr
         self.n_hr = n_hr
         self.n_bipartite = n_lr + n_hr
+        self.raw_output = raw_output
 
         self.input_proj = nn.Sequential(
             nn.Linear(n_lr, hidden_dim),
@@ -156,6 +158,7 @@ class DenseBiSRGenerator(nn.Module):
         A_pred = 0.5 * (HP @ HP.transpose(1, 2) + (HP @ HP.transpose(1, 2)).transpose(1, 2))
         idx = self._get_triu_indices(A_pred.device)
         pred = A_pred[:, idx[0], idx[1]]
+        if self.raw_output:
+            return pred  # residual mode: caller adds y_mean back; can be negative
         pred = F.softplus(pred)
-        # Spec: data range [0,1]; post-process to avoid negatives and cap at 1
         return pred.clamp(min=0.0, max=1.0)

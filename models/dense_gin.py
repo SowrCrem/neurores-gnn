@@ -1,10 +1,12 @@
 """
 Dense GIN (Graph Isomorphism Network) for brain graph super-resolution.
 
-Replaces GCN message passing with GIN-style sum aggregation + MLP:
-  h' = MLP((1+ε)·h + A @ h) + h
+Uses GIN-style aggregation with degree-normalised adjacency (S@H) for scale stability:
+  h' = MLP((1+ε)·h + S @ h) + h
+  where S = D^{-1/2}(A+I)D^{-1/2} (same as DenseGCN).
 
-- Weighted aggregation: A @ H preserves edge weights [0,1].
+- S@H (not raw A@H) avoids scale distortion on weighted graphs; raw A@H causes
+  high-degree nodes to dominate and led to ~0.48 MAE collapse.
 - Same pipeline as DenseGCN: linear upsample, bilinear decoder.
 - Conservative decoder init, softplus, clamp [0,1] per spec.
 
@@ -17,7 +19,7 @@ import torch.nn.functional as F
 
 
 class DenseGINBlock(nn.Module):
-    """Single GIN layer: (1+ε)*H + A@H → MLP → residual."""
+    """Single GIN layer: (1+ε)*H + S@H → MLP → residual. Uses S (normalised adj) for scale stability."""
 
     def __init__(self, dim: int, dropout: float = 0.3):
         super().__init__()

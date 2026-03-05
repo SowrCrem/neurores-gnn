@@ -6,6 +6,8 @@
 
 **Source of truth:** Official spec `70105_3_spec.pdf` (DGL Project Spring 2026: Brain Graph Super-Resolution Challenge).
 
+**Current best:** 0.1326 (v3r). **Target:** 0.126. **Action plan:** [PATH_TO_0_126.md](PATH_TO_0_126.md)
+
 ---
 
 ## 0. Explicit Spec Constraints (from 70105_3_spec.pdf)
@@ -93,7 +95,7 @@ These are **mandatory** requirements from the official specification. Non-compli
 
 | Constraint | Implication |
 |------------|-------------|
-| **Decoder design** | Bilinear decoders (H @ W @ H^T) are parameter-efficient and enforce symmetry. Avoid fully connected decoders that predict each edge independently. |
+| **Decoder design** | Bilinear decoders (H @ W @ H^T) are parameter-efficient and enforce symmetry, but they fail to capture higher-order topological features (cliques, hubs). To reach SOTA (MAE ~0.126), consider a **dual-graph / line-graph formulation** (e.g., STP-GSR framework) where HR edges are treated as nodes in a dual graph, enabling direct structural feature learning on edges rather than inferring them from node embeddings. |
 | **Non-negativity** | Use softplus or similar for outputs; avoid ReLU/clamp before the decoder, which can cause collapse and PCC=NaN. |
 | **Gradient flow** | Ensure gradients reach the decoder; avoid activations that zero out many values (e.g. ReLU before bilinear). |
 
@@ -156,10 +158,10 @@ These are **mandatory** requirements from the official specification. Non-compli
 
 ---
 
-## 8. Spectral Positional Encodings (Optional)
+## 8. Positional and Structural Encodings
 
-**None of the baseline models** (DenseGCN, DenseGAT, SGC, GCN+Cross-Attn) use spectral positional encodings. Among the recommended SOTA models, **only GraphGPS** explicitly supports Laplacian-based spectral encodings.
+**None of the baseline models** (DenseGCN, DenseGAT, SGC, GCN+Cross-Attn) use structural positional encodings (PEs). Considering the nodes represent fixed atlas regions, structural identity is critical.
 
-- **When to consider:** For GraphGPS-style or transformer-heavy architectures where structural awareness matters. Laplacian eigenvectors can improve long-range dependency modeling.
-- **Caveats:** Eigendecomposition adds compute; with 167 samples, heavy use may overfit. Use sparingly (e.g. top-k eigenvectors) and with strong regularization.
-- **Alternatives:** Bi-SR uses fixed random features for HR node initialization; DEFEND/STP-GSR use dual-graph formulations without explicit positional encoding.
+- **Spectral Positional Encodings (LapPE):** GraphGPS supports Laplacian-based spectral encodings. However, eigendecomposition is costly and potentially problematic with sign ambiguity.
+- **Learnable Positional Encodings (PEARL):** A strong 2025 alternative (ICLR 2025). Message-passing networks initialized with standard basis vectors can efficiently generate highly expressive learnable PEs, replacing Laplacian PEs with linear complexity.
+- **When to consider:** Given the strict 160→268 atlas mapping, injecting PEs before the first GNN layer gives the model an anchor to identify specific brain regions (e.g. recognizing "this is the frontal lobe"). Highly recommended to break the symmetry and improve topological PCC.

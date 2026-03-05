@@ -1,27 +1,55 @@
 # Kaggle Submission Analysis: Brain Graph Super-Resolution
 
-> Thorough analysis of all 17 submissions to the DGL 2026 Brain Graph Super-Resolution Challenge.  
-> Primary metric: **MAE** (lower is better).
+> Thorough analysis of submissions to the DGL 2026 Brain Graph Super-Resolution Challenge.  
+> Primary metric: **MAE** (lower is better).  
+> **Ground truth:** See [KAGGLE_SUBMISSIONS_GROUND_TRUTH.md](KAGGLE_SUBMISSIONS_GROUND_TRUTH.md) for the canonical submission table.
 
 ---
 
 ## 1. Executive Summary
 
+### v3r Era (2025-03, Best: 0.132)
+
+| Finding                                   | Implication                                                                                                 |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| **v3r dominates**                         | DenseGCN v3r (L1 + residual + mixup): **0.132567** MAE. ~25% improvement over v3.                           |
+| **Residual + mixup critical**             | v3r vs v3: 0.133 vs 0.176. No mixup (v3r_nomixup): 0.1327 — marginal difference.                           |
+| **DenseGIN v3r breaks 0.48 barrier**      | gin_v3r: 0.138–0.140 vs gin (unnormalized): 0.48. v3r training (L1, residual, mixup) transfers.             |
+| **Best single**                          | `v3r_submission.csv` — **0.132567** (600 epochs, seed 42).                                                  |
+| **Best ensemble**                        | `v3r_ensemble_val.csv` — 0.132789. Single seed competitive.                                                 |
+
+### Legacy (Pre-v3r)
 
 | Finding                                   | Implication                                                                                                 |
 | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
 | **Bimodal performance gap**               | DenseGCN family: ~0.17–0.20 MAE. All alternatives (GAT, GIN, Bi-SR, CA, GPS): ~0.47–0.48 MAE.               |
 | **Full retrain is critical**              | v3 full retrain: 0.176 vs v3 ensemble (no full retrain): 0.196 — **~11% relative improvement**.             |
 | **Architecture matters more than tuning** | DenseGCN v3 variants (dropout, hidden dim) stay in 0.176–0.178. Alternative architectures plateau at ~0.48. |
-| **Best single model**                     | `dense_gcn_v3_full_retrain_submission.csv` — **0.176083** MAE.                                              |
-| **Best ensemble**                         | `dense_gcn_v3_ensemble_full_submission.csv` — **0.176744** MAE (3 seeds, full retrain).                     |
 
 
 ---
 
 ## 2. Results by Tier
 
-### Tier 1: Strong Performers (MAE 0.17–0.20)
+### Tier 0: v3r Era (MAE 0.132–0.140)
+
+| Submission           | MAE       | Notes                                              |
+| -------------------- | --------- | -------------------------------------------------- |
+| v3r_submission       | **0.1326**| L1 + residual + mixup, 600 epochs                  |
+| v3r_nomixup          | 0.1327   | v3r without mixup                                  |
+| v3r_ensemble_val     | 0.1328   | Ensemble w/ val set                                |
+| v3r_godzilla         | 0.1336   | hidden=256, 4 layers, cosine LR                   |
+| v3r_ensemble         | 0.1337   | Multi-seed ensemble                                |
+| v3sn_nc_submission   | 0.1339   | Scale norm, no calibration                          |
+| v3r_cos_full         | 0.1340   | Cosine annealing LR                                |
+| v3r_seed43/44        | 0.1346–0.1347 | Different seeds                              |
+| v3r_submission_800   | 0.1359   | 800 epochs                                         |
+| v3r_lrs_100ep        | 0.1372   | Low-rank/sparse decoder, 100 epochs                 |
+| gin_v3r_*             | 0.138–0.140 | DenseGIN + v3r training                        |
+| v3sn_submission      | 0.1391   | Scale norm + calibration (worse than no cal)      |
+| v3r_lrs_submission   | 0.1403   | Low-rank/sparse, 300 epochs, no val split          |
+
+### Tier 1: Legacy Strong Performers (MAE 0.17–0.20)
 
 
 | Submission                 | MAE          | Notes                                    |
@@ -146,6 +174,9 @@
 
 ## 5. Data Summary Table
 
+**Full ground truth:** [KAGGLE_SUBMISSIONS_GROUND_TRUTH.md](KAGGLE_SUBMISSIONS_GROUND_TRUTH.md)
+
+### Legacy (v3 and earlier)
 
 | Rank | Submission                 | MAE      | Model            | Full Retrain? |
 | ---- | -------------------------- | -------- | ---------------- | ------------- |

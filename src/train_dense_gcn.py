@@ -35,8 +35,10 @@ from models.dense_gin import DenseGINGenerator
 from models.dense_gcn import DenseGCNGenerator
 from models.dense_gcn_ca import DenseGCNCrossAttnGenerator
 from models.dense_gcn_gps import DenseGCNGPSGenerator
+from models.dense_gcn_lrs import DenseGCNLRSGenerator
 from models.dense_graphsage import DenseGraphSAGEGenerator
 from models.dense_gat import DenseGATGenerator
+from models.dense_stp import DenseSTPGenerator
 from utils.matrix_vectorizer import MatrixVectorizer
 from utils.metrics import METRIC_ORDER, evaluate_fold
 from utils.plotting import summarize_folds
@@ -90,6 +92,16 @@ class TrainConfig:
     edge_scale: float = 0.2
     bipartite_layers: int = 1  # Bi-SR only
     max_epochs_full: int = 50  # cap for full retrain (CV guides best; 50 ≈ convergence)
+    use_residual: bool = False   # subtract per-edge HR mean from targets; add back at inference
+    mixup_alpha: float = 0.0     # Graph Mixup alpha: 0=disabled, 0.2=recommended
+    subject_scale: bool = False  # per-subject LR std normalisation (divide LR & HR by subject's LR std)
+    calibrate: bool = False      # post-hoc linear calibration of val predictions (slope+intercept per fold)
+    lap_pe_dim: int = 0          # Laplacian PE: number of eigenvectors appended to node features (0=disabled)
+    pearl_pe_dim: int = 0        # PEARL positional encoding dimension (0=disabled)
+    lr_schedule: str = "plateau" # LR schedule: 'plateau' (ReduceLROnPlateau), 'cosine' (CosineAnnealingLR), 'none'
+    lr_min: float = 1e-6         # minimum LR for cosine / plateau schedules
+    curriculum_phase_epochs: int = 0   # Phase 1: train on heavy edges only; 0=disabled
+    curriculum_heavy_percentile: float = 50.0  # Percentile for "heavy" edges (top X% by mean weight)
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,8 +113,8 @@ def parse_args() -> argparse.Namespace:
     def add_shared(p: argparse.ArgumentParser) -> None:
         p.add_argument("--data-dir", type=str, default=DEFAULT_DATA_DIR)
         p.add_argument("--out-dir", type=str, default=DEFAULT_OUT_DIR)
-        p.add_argument("--preset", type=str, default="v2", choices=["v2", "v3", "v4", "v5", "bisr", "bisr_v2", "gcn_ca", "gin", "gps", "graphsage"])
-        p.add_argument("--model", type=str, default="dense_gcn", choices=["dense_gcn", "dense_gat", "dense_bisr", "dense_gcn_ca", "dense_gin", "dense_gcn_gps", "dense_graphsage"])
+        p.add_argument("--preset", type=str, default="v2", choices=["v2", "v3", "v3r", "v3sn", "v3r_pe", "v3r_lrs", "v3r_cos", "v4", "v5", "bisr", "bisr_v2", "gcn_ca", "gin", "gin_n", "gin_v3r", "gps", "gps_v3r", "graphsage", "sage_v3r", "stp", "stp_pe"])
+        p.add_argument("--model", type=str, default="dense_gcn", choices=["dense_gcn", "dense_gat", "dense_bisr", "dense_gcn_ca", "dense_gin", "dense_gcn_gps", "dense_gcn_lrs", "dense_graphsage", "dense_stp"])
         p.add_argument("--seed", type=int, default=42)
         p.add_argument("--epochs", type=int, default=400)
         p.add_argument("--patience", type=int, default=30)
@@ -129,6 +141,19 @@ def parse_args() -> argparse.Namespace:
         p.add_argument("--hr-refine-layers", type=int, default=1)
         p.add_argument("--edge-scale", type=float, default=0.2, help="GAT: adjacency bias strength (0.1=weak, 0.5=strong)")
         p.add_argument("--bipartite-layers", type=int, default=1, help="Bi-SR: number of bipartite GNN layers (1-2)")
+        p.add_argument("--use-residual", action="store_true", default=False, help="Subtract per-edge HR mean from targets; add back at inference (residual learning)")
+        p.add_argument("--mixup-alpha", type=float, default=0.0, help="Graph Mixup alpha; 0=disabled, 0.2=recommended")
+        p.add_argument("--subject-scale", action="store_true", default=False, help="Per-subject LR-std normalisation of LR & HR edge weights before training")
+        p.add_argument("--calibrate", action="store_true", default=False, help="Post-hoc linear calibration of predictions using val fold (slope+intercept)")
+        p.add_argument("--lap-pe-dim", type=int, default=0, help="Laplacian PE: number of eigenvectors appended as node features (0=disabled, 4=recommended)")
+        p.add_argument("--pearl-pe-dim", type=int, default=0, help="PEARL positional encoding: number of learnable features (0=disabled, 32-128=recommended)")
+        p.add_argument("--lr-schedule", type=str, default="plateau", choices=["plateau", "cosine", "none"],
+                       help="LR schedule: 'plateau' (ReduceLROnPlateau, default), 'cosine' (CosineAnnealingLR), 'none'")
+        p.add_argument("--lr-min", type=float, default=1e-6, help="Minimum LR for cosine/plateau schedule (default 1e-6)")
+        p.add_argument("--curriculum-phase-epochs", type=int, default=0,
+                       help="Curriculum: phase 1 trains on heavy edges only for this many epochs; 0=disabled")
+        p.add_argument("--curriculum-heavy-percentile", type=float, default=50.0,
+                       help="Curriculum: percentile for heavy edges (top X%% by mean weight; default 50)")
 
     cv = sub.add_parser("cv", help="Run 3-fold CV and log metrics/resources.")
     add_shared(cv)
@@ -163,6 +188,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Comma-separated seeds for full-retrain ensemble (e.g. 42,43,44). Each model trained on all 167; predictions averaged.",
     )
+    full.add_argument(
+        "--shrinkage-eps",
+        type=float,
+        default=0.05,
+        help="Inference shrinkage toward training mean: pred=(1-eps)*pred+eps*mean. 0=disabled. Try 0.03-0.10; stop when MAE worsens.",
+    )
+    full.add_argument("--bias-correct", action="store_true", default=False,
+                      help="Post-hoc bias: subtract mean(pred-gt) on val from test preds. Requires val-ratio>0.")
 
     tune = sub.add_parser("tune", help="Hyperparameter tuning: Optuna Bayesian optimization on 3-fold CV.")
     add_shared(tune)
@@ -172,6 +205,7 @@ def parse_args() -> argparse.Namespace:
     tune.add_argument("--fresh", action="store_true", help="Clear Optuna study and start from scratch")
     tune.add_argument("--full-retrain", action="store_true", help="After tuning, run full retrain with best config and save submission")
     tune.add_argument("--submission-path", type=str, default=None, help="Submission CSV path (used with --full-retrain; default: out-dir/submission.csv)")
+    tune.add_argument("--shrinkage-eps", type=float, default=0.05, help="Inference shrinkage (used with --full-retrain). 0=disabled.")
 
     return parser.parse_args()
 
@@ -258,6 +292,7 @@ def build_model(cfg: TrainConfig, device: torch.device) -> nn.Module:
             hidden_dim=cfg.hidden_dim,
             num_layers=cfg.num_layers,
             dropout=cfg.dropout,
+            raw_output=cfg.use_residual,
         ).to(device)
     if cfg.model_name == "dense_gcn_gps":
         return DenseGCNGPSGenerator(
@@ -267,6 +302,17 @@ def build_model(cfg: TrainConfig, device: torch.device) -> nn.Module:
             num_layers=cfg.num_layers,
             num_heads=cfg.num_heads,
             dropout=cfg.dropout,
+            raw_output=cfg.use_residual,
+        ).to(device)
+    if cfg.model_name == "dense_gcn_lrs":
+        return DenseGCNLRSGenerator(
+            n_lr=cfg.n_lr,
+            n_hr=cfg.n_hr,
+            hidden_dim=cfg.hidden_dim,
+            num_layers=cfg.num_layers,
+            dropout=cfg.dropout,
+            raw_output=cfg.use_residual,
+            lap_pe_dim=cfg.lap_pe_dim,
         ).to(device)
     if cfg.model_name == "dense_graphsage":
         return DenseGraphSAGEGenerator(
@@ -276,12 +322,26 @@ def build_model(cfg: TrainConfig, device: torch.device) -> nn.Module:
             num_layers=cfg.num_layers,
             dropout=cfg.dropout,
         ).to(device)
+    if cfg.model_name == "dense_stp":
+        return DenseSTPGenerator(
+            n_lr=cfg.n_lr,
+            n_hr=cfg.n_hr,
+            hidden_dim=cfg.hidden_dim,
+            num_layers=cfg.num_layers,
+            dropout=cfg.dropout,
+            raw_output=cfg.use_residual,
+            lap_pe_dim=cfg.lap_pe_dim,
+            pearl_pe_dim=cfg.pearl_pe_dim,
+        ).to(device)
     return DenseGCNGenerator(
         n_lr=cfg.n_lr,
         n_hr=cfg.n_hr,
         hidden_dim=cfg.hidden_dim,
         num_layers=cfg.num_layers,
         dropout=cfg.dropout,
+        raw_output=cfg.use_residual,
+        lap_pe_dim=cfg.lap_pe_dim,
+        pearl_pe_dim=cfg.pearl_pe_dim,
     ).to(device)
 
 
@@ -319,7 +379,7 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
             "patience": 45,
             "loss": "smoothl1",
             "l1_weight": 0.7,
-            "huber_beta": 1.0,
+            "huber_beta": 0.05,   # was 1.0 — now L1 region kicks in at |err|>0.05 (appropriate for [0,1] edges)
             "num_heads": 4,
             "ffn_mult": 4,
             "num_decoder_heads": 4,
@@ -456,6 +516,217 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
             "hr_refine_layers": 1,
             "edge_scale": 0.2,
         },
+        "v3r": {
+            "model": "dense_gcn",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 60,
+            "loss": "l1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "use_residual": True,
+            "mixup_alpha": 0.2,
+        },
+        # v3sn = v3r + per-subject scale normalisation + post-hoc calibration
+        "v3sn": {
+            "model": "dense_gcn",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 60,
+            "loss": "l1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "use_residual": True,
+            "mixup_alpha": 0.2,
+            "subject_scale": True,
+            "calibrate": True,
+        },
+        # gin_n = GIN with normalised adjacency + subject scale normalisation
+        "gin_n": {
+            "model": "dense_gin",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 45,
+            "loss": "smoothl1",
+            "l1_weight": 0.7,
+            "huber_beta": 0.05,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "subject_scale": True,
+            "calibrate": True,
+        },
+        # v3r_pe = v3r + Laplacian eigenvector positional encoding (k=4)
+        "v3r_pe": {
+            "model": "dense_gcn",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 60,
+            "loss": "l1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "use_residual": True,
+            "mixup_alpha": 0.2,
+            "lap_pe_dim": 4,
+        },
+        # gin_v3r = GIN (normalised adjacency) + v3r training improvements
+        "gin_v3r": {
+            "model": "dense_gin",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 60,
+            "loss": "l1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "use_residual": True,
+            "mixup_alpha": 0.2,
+        },
+        # gps_v3r = GraphGPS (GCN + linear attention) + v3r training improvements
+        "gps_v3r": {
+            "model": "dense_gcn_gps",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 60,
+            "loss": "l1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "use_residual": True,
+            "mixup_alpha": 0.2,
+        },
+        # sage_v3r = GraphSAGE (mean aggregation) + v3r training improvements
+        "sage_v3r": {
+            "model": "dense_graphsage",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 60,
+            "loss": "l1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "use_residual": True,
+            "mixup_alpha": 0.2,
+        },
+        # v3r_lrs = DenseGCN + Low-Rank + Sparse decoder + v3r training improvements
+        "v3r_lrs": {
+            "model": "dense_gcn_lrs",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 60,
+            "loss": "l1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "use_residual": True,
+            "mixup_alpha": 0.2,
+        },
+        # v3r_cos = v3r + cosine annealing LR schedule (lr: 8e-4 → 1e-5 over T epochs)
+        "v3r_cos": {
+            "model": "dense_gcn",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 60,
+            "loss": "l1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "use_residual": True,
+            "mixup_alpha": 0.2,
+            "lr_min": 1e-5,
+        },
+        "stp": {
+            "model": "dense_stp",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 60,
+            "loss": "l1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "use_residual": True,
+            "mixup_alpha": 0.2,
+        },
+        "stp_pe": {
+            "model": "dense_stp",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 60,
+            "loss": "l1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "use_residual": True,
+            "mixup_alpha": 0.2,
+            "pearl_pe_dim": 128,
+        },
     }
     chosen = preset_map[args.preset]
     defaults = parse_args_defaults()
@@ -485,6 +756,14 @@ def parse_args_defaults() -> dict:
         "hr_refine_layers": 1,
         "edge_scale": 0.2,
         "bipartite_layers": 1,
+        "use_residual": False,
+        "mixup_alpha": 0.0,
+        "subject_scale": False,
+        "calibrate": False,
+        "lap_pe_dim": 0,
+        "pearl_pe_dim": 0,
+        "lr_schedule": "plateau",
+        "lr_min": 1e-6,
     }
 
 
@@ -501,6 +780,152 @@ def build_loss(cfg: TrainConfig) -> nn.Module:
     raise ValueError(f"Unsupported loss: {cfg.loss_name}")
 
 
+# ---------------------------------------------------------------------------
+# Per-subject scale normalisation helpers
+# ---------------------------------------------------------------------------
+
+def compute_subject_scales(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """Compute per-subject scale = std of each subject's edge-weight vector.
+
+    Args:
+        x: (N, E) array of vectorised adjacency matrices, one row per subject.
+        eps: Floor to prevent division by zero for near-constant subjects.
+    Returns:
+        scales: (N, 1) float32 array, one scale per subject.
+    """
+    scales = x.std(axis=1, keepdims=True).astype(np.float32)
+    return np.maximum(scales, eps)
+
+
+def apply_subject_scale(x: np.ndarray, scales: np.ndarray) -> np.ndarray:
+    """Divide each subject's edge-weight vector by its own scale.
+
+    Args:
+        x:      (N, E) edge-weight matrix.
+        scales: (N, 1) per-subject scales from compute_subject_scales().
+    Returns:
+        x_norm: (N, E) normalised array (same dtype as x).
+    """
+    return (x / scales).astype(x.dtype)
+
+
+# ---------------------------------------------------------------------------
+# Post-hoc calibration helpers
+# ---------------------------------------------------------------------------
+
+def fit_calibration(pred: np.ndarray, true: np.ndarray) -> tuple[float, float]:
+    """Fit a linear calibration y_cal = slope * y_pred + intercept via OLS.
+
+    Flattens both arrays and solves the 1-D least-squares problem.  Used to
+    remove systematic bias introduced by softplus / residual learning offsets.
+
+    Args:
+        pred: (N, E) predicted edge weights.
+        true: (N, E) ground-truth edge weights.
+    Returns:
+        (slope, intercept): calibration coefficients.
+    """
+    p = pred.reshape(-1).astype(np.float64)
+    t = true.reshape(-1).astype(np.float64)
+    # OLS: [slope, intercept] = (X^T X)^{-1} X^T t  with X = [p, 1]
+    A = np.stack([p, np.ones_like(p)], axis=1)
+    result, *_ = np.linalg.lstsq(A, t, rcond=None)
+    slope, intercept = float(result[0]), float(result[1])
+    return slope, intercept
+
+
+def apply_calibration(
+    pred: np.ndarray,
+    slope: float,
+    intercept: float,
+) -> np.ndarray:
+    """Apply linear calibration and clamp to [0, inf).
+
+    Args:
+        pred:      (N, E) raw predictions.
+        slope:     calibration slope.
+        intercept: calibration intercept.
+    Returns:
+        pred_cal: (N, E) calibrated predictions, clipped to >= 0.
+    """
+    pred_cal = slope * pred + intercept
+    return np.clip(pred_cal, a_min=0.0, a_max=None).astype(pred.dtype)
+
+
+def compute_bias_correction(pred: np.ndarray, true: np.ndarray) -> np.ndarray:
+    """Compute per-edge bias: mean(pred - gt). Shape (E,)."""
+    return (pred - true).mean(axis=0).astype(np.float32)
+
+
+
+
+def compute_lap_pe(
+    x_vecs: np.ndarray,
+    n_lr: int,
+    k: int,
+    vectorizer: MatrixVectorizer,
+) -> np.ndarray:
+    """Compute k-dim Laplacian eigenvector PE for each subject.
+
+    Uses the k eigenvectors of the normalised Laplacian L = I - D^{-1/2}AD^{-1/2}
+    corresponding to the *smallest non-trivial* eigenvalues (i.e. skip the 0-eigenvalue).
+    Sign ambiguity is fixed: each eigenvector is flipped so its first non-zero element
+    is positive (canonical sign convention from Dwivedi et al., 2022).
+
+    Args:
+        x_vecs:     (N, E) upper-triangle adjacency vectors, one row per subject.
+        n_lr:       number of LR nodes (160).
+        k:          number of eigenvectors to use as PE.
+        vectorizer: MatrixVectorizer used elsewhere for adjacency conversion.
+    Returns:
+        (N, n_lr * k) float32 array of flattened per-subject PE matrices.
+    """
+    N = len(x_vecs)
+    pe_all = np.zeros((N, n_lr, k), dtype=np.float32)
+    I = np.eye(n_lr, dtype=np.float64)
+    for i, x_vec in enumerate(x_vecs):
+        A = vectorizer.anti_vectorize(x_vec, n_lr, include_diagonal=False).astype(np.float64)
+        A = (A + A.T) / 2.0  # enforce symmetry
+        # Row-normalise: D^{-1/2} A D^{-1/2}
+        deg = A.sum(axis=1).clip(min=1e-8)
+        d_inv_sqrt = 1.0 / np.sqrt(deg)
+        S = (A * d_inv_sqrt[:, None]) * d_inv_sqrt[None, :]  # normalised adjacency
+        L = I - S  # normalised Laplacian
+        # Compute smallest k+1 eigenpairs; eigvecs sorted ascending by eigenvalue
+        eigvals, eigvecs = np.linalg.eigh(L)  # (n_lr,), (n_lr, n_lr) sorted ascending
+        # Skip trivial eigenvector (eigenvalue ≈ 0); take columns 1..k
+        pe = eigvecs[:, 1:k + 1].astype(np.float32)  # (n_lr, k)
+        # Pad if not enough eigenvectors (shouldn't happen for n_lr=160, k=4)
+        if pe.shape[1] < k:
+            pe = np.pad(pe, ((0, 0), (0, k - pe.shape[1])))
+        # Sign fix: flip each eigenvector so its first large-magnitude element is positive
+        for j in range(k):
+            col = pe[:, j]
+            nz = np.where(np.abs(col) > 1e-6)[0]
+            if len(nz) > 0 and col[nz[0]] < 0:
+                pe[:, j] = -col
+        pe_all[i] = pe
+    return pe_all.reshape(N, n_lr * k)  # (N, n_lr * k)
+
+
+def mixup_batch(
+    x_vec: torch.Tensor, y_vec: torch.Tensor, alpha: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Graph Mixup: λ ~ Beta(alpha, alpha), applied with 50% probability.
+
+    Convex combinations of symmetric connectivity matrices are valid brain
+    graphs (symmetric, non-negative, [0,1]-bounded under clamp), so mixup
+    in adjacency space is domain-valid.
+    """
+    if alpha <= 0.0 or np.random.random() > 0.5:
+        return x_vec, y_vec
+    lam = float(np.random.beta(alpha, alpha))
+    idx = torch.randperm(x_vec.size(0), device=x_vec.device)
+    x_mix = lam * x_vec + (1.0 - lam) * x_vec[idx]
+    y_mix = lam * y_vec + (1.0 - lam) * y_vec[idx]
+    return x_mix, y_mix
+
+
 def train_with_validation(
     cfg: TrainConfig,
     device: torch.device,
@@ -510,22 +935,47 @@ def train_with_validation(
     x_va: np.ndarray,
     y_va: np.ndarray,
     fold_id: int,
+    y_mean: np.ndarray | None = None,
 ) -> tuple[DenseGCNGenerator, float, int]:
+    n_lr_e = cfg.n_lr * (cfg.n_lr - 1) // 2  # length of adjacency upper-triangle vector
     xtr = torch.from_numpy(x_tr).float().to(device)
     ytr = torch.from_numpy(y_tr).float().to(device)
     xva = torch.from_numpy(x_va).float().to(device)
     yva = torch.from_numpy(y_va).float().to(device)
 
+    # Residual learning: subtract per-edge mean so the model predicts deviations
+    if cfg.use_residual and y_mean is not None:
+        y_mean_t = torch.from_numpy(y_mean).float().to(device)
+        ytr = ytr - y_mean_t.unsqueeze(0)
+        yva = yva - y_mean_t.unsqueeze(0)
+
     tr_loader = DataLoader(TensorDataset(xtr, ytr), batch_size=cfg.batch_size, shuffle=True)
     va_loader = DataLoader(TensorDataset(xva, yva), batch_size=cfg.batch_size, shuffle=False)
+
+    # Curriculum: phase 1 = heavy edges only (top X% by mean weight)
+    edge_mask_t: torch.Tensor | None = None
+    if cfg.curriculum_phase_epochs > 0:
+        y_mean_edges = y_tr.mean(axis=0)
+        thresh = np.percentile(y_mean_edges, cfg.curriculum_heavy_percentile)
+        edge_mask = (y_mean_edges >= thresh)
+        edge_mask_t = torch.from_numpy(edge_mask).to(device)
+        n_heavy = int(edge_mask.sum())
+        print(f"  Curriculum: phase 1 (epochs 1–{cfg.curriculum_phase_epochs}) on {n_heavy}/{len(edge_mask)} heavy edges (≥p{cfg.curriculum_heavy_percentile:.0f})")
 
     model = build_model(cfg, device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=15, min_lr=1e-6
-    )
+    if cfg.lr_schedule == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=cfg.epochs, eta_min=cfg.lr_min
+        )
+    elif cfg.lr_schedule == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=15, min_lr=cfg.lr_min
+        )
+    else:
+        scheduler = None
     base_loss_fn = build_loss(cfg)
 
     best_val = float("inf")
@@ -535,15 +985,33 @@ def train_with_validation(
 
     for epoch in range(1, cfg.epochs + 1):
         model.train()
+        use_curriculum = edge_mask_t is not None and epoch <= cfg.curriculum_phase_epochs
         train_losses_epoch = []
         for x_vec, y_vec in tr_loader:
-            a = vec_to_adj(x_vec, cfg.n_lr, vectorizer)
-            pred = model(a, a)
-            if cfg.loss_name == "hybrid":
-                loss = cfg.l1_weight * nn.functional.l1_loss(pred, y_vec) + \
-                    (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
+            # Graph Mixup augmentation (50% probability when alpha > 0)
+            x_vec, y_vec = mixup_batch(x_vec, y_vec, cfg.mixup_alpha)
+            if cfg.lap_pe_dim > 0:
+                adj_vec = x_vec[:, :n_lr_e]
+                pe_vec  = x_vec[:, n_lr_e:].reshape(x_vec.size(0), cfg.n_lr, cfg.lap_pe_dim)
+                a = vec_to_adj(adj_vec, cfg.n_lr, vectorizer)
+                pred = model(a, a, pe_vec)
             else:
-                loss = base_loss_fn(pred, y_vec)
+                a = vec_to_adj(x_vec, cfg.n_lr, vectorizer)
+                pred = model(a, a)
+            if use_curriculum:
+                pred_m = pred[:, edge_mask_t]
+                y_m = y_vec[:, edge_mask_t]
+                if cfg.loss_name == "hybrid":
+                    loss = cfg.l1_weight * nn.functional.l1_loss(pred_m, y_m) + \
+                        (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred_m, y_m)
+                else:
+                    loss = base_loss_fn(pred_m, y_m)
+            else:
+                if cfg.loss_name == "hybrid":
+                    loss = cfg.l1_weight * nn.functional.l1_loss(pred, y_vec) + \
+                        (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
+                else:
+                    loss = base_loss_fn(pred, y_vec)
             train_losses_epoch.append(loss.item())
 
             optimizer.zero_grad(set_to_none=True)
@@ -556,8 +1024,14 @@ def train_with_validation(
         val_losses = []
         with torch.no_grad():
             for x_vec, y_vec in va_loader:
-                a = vec_to_adj(x_vec, cfg.n_lr, vectorizer)
-                pred = model(a, a)
+                if cfg.lap_pe_dim > 0:
+                    adj_vec = x_vec[:, :n_lr_e]
+                    pe_vec  = x_vec[:, n_lr_e:].reshape(x_vec.size(0), cfg.n_lr, cfg.lap_pe_dim)
+                    a = vec_to_adj(adj_vec, cfg.n_lr, vectorizer)
+                    pred = model(a, a, pe_vec)
+                else:
+                    a = vec_to_adj(x_vec, cfg.n_lr, vectorizer)
+                    pred = model(a, a)
                 if cfg.loss_name == "hybrid":
                     val_loss = cfg.l1_weight * nn.functional.l1_loss(pred, y_vec) + \
                         (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
@@ -566,7 +1040,11 @@ def train_with_validation(
                 val_losses.append(val_loss.item())
 
         val_loss = float(np.mean(val_losses))
-        scheduler.step(val_loss)
+        if scheduler is not None:
+            if cfg.lr_schedule == "cosine":
+                scheduler.step()
+            else:
+                scheduler.step(val_loss)
         improved = val_loss < best_val
         if improved:
             best_val = val_loss
@@ -609,17 +1087,40 @@ def train_full(
     x_va: np.ndarray | None = None,
     y_va: np.ndarray | None = None,
     patience: int | None = None,
+    y_mean: np.ndarray | None = None,
 ) -> DenseGCNGenerator:
     """Full retrain. If x_va/y_va provided, use early stopping; else run for max_epochs."""
     epochs = max_epochs if max_epochs is not None else cfg.max_epochs_full
     xtr = torch.from_numpy(x_tr).float().to(device)
     ytr = torch.from_numpy(y_tr).float().to(device)
+
+    # Residual learning: subtract per-edge mean so the model predicts deviations
+    if cfg.use_residual and y_mean is not None:
+        y_mean_t = torch.from_numpy(y_mean).float().to(device)
+        ytr = ytr - y_mean_t.unsqueeze(0)
+
     tr_loader = DataLoader(TensorDataset(xtr, ytr), batch_size=cfg.batch_size, shuffle=True)
+
+    # Curriculum: phase 1 = heavy edges only
+    edge_mask_t: torch.Tensor | None = None
+    if cfg.curriculum_phase_epochs > 0:
+        y_mean_edges = y_tr.mean(axis=0)
+        thresh = np.percentile(y_mean_edges, cfg.curriculum_heavy_percentile)
+        edge_mask = (y_mean_edges >= thresh)
+        edge_mask_t = torch.from_numpy(edge_mask).to(device)
+        n_heavy = int(edge_mask.sum())
+        print(f"  Curriculum: phase 1 (epochs 1–{cfg.curriculum_phase_epochs}) on {n_heavy}/{len(edge_mask)} heavy edges")
 
     model = build_model(cfg, device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
     )
+    if cfg.lr_schedule == "cosine":
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epochs, eta_min=cfg.lr_min
+        )
+    else:
+        lr_scheduler = None
     base_loss_fn = build_loss(cfg)
     if cfg.model_name in ("dense_gat", "dense_bisr", "dense_gcn_ca", "dense_gin", "dense_gcn_gps", "dense_graphsage"):
         grad_clip = lambda: torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
@@ -630,6 +1131,10 @@ def train_full(
     if use_early_stop:
         xva = torch.from_numpy(x_va).float().to(device)
         yva = torch.from_numpy(y_va).float().to(device)
+        # Residual learning: val targets also centred on the same mean
+        if cfg.use_residual and y_mean is not None:
+            y_mean_t_va = torch.from_numpy(y_mean).float().to(device)
+            yva = yva - y_mean_t_va.unsqueeze(0)
         va_loader = DataLoader(TensorDataset(xva, yva), batch_size=cfg.batch_size, shuffle=False)
     best_val = float("inf")
     best_state = None
@@ -637,28 +1142,57 @@ def train_full(
 
     for epoch in range(1, epochs + 1):
         model.train()
+        use_curriculum = edge_mask_t is not None and epoch <= cfg.curriculum_phase_epochs
         train_losses = []
         for x_vec, y_vec in tr_loader:
-            a = vec_to_adj(x_vec, cfg.n_lr, vectorizer)
-            pred = model(a, a)
-            if cfg.loss_name == "hybrid":
-                loss = cfg.l1_weight * nn.functional.l1_loss(pred, y_vec) + \
-                    (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
+            # Graph Mixup augmentation (50% probability when alpha > 0)
+            x_vec, y_vec = mixup_batch(x_vec, y_vec, cfg.mixup_alpha)
+            n_lr_e_full = cfg.n_lr * (cfg.n_lr - 1) // 2
+            if cfg.lap_pe_dim > 0:
+                adj_vec = x_vec[:, :n_lr_e_full]
+                pe_vec  = x_vec[:, n_lr_e_full:].reshape(x_vec.size(0), cfg.n_lr, cfg.lap_pe_dim)
+                a = vec_to_adj(adj_vec, cfg.n_lr, vectorizer)
+                pred = model(a, a, pe_vec)
             else:
-                loss = base_loss_fn(pred, y_vec)
+                a = vec_to_adj(x_vec, cfg.n_lr, vectorizer)
+                pred = model(a, a)
+            if use_curriculum:
+                pred_m, y_m = pred[:, edge_mask_t], y_vec[:, edge_mask_t]
+                if cfg.loss_name == "hybrid":
+                    loss = cfg.l1_weight * nn.functional.l1_loss(pred_m, y_m) + \
+                        (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred_m, y_m)
+                else:
+                    loss = base_loss_fn(pred_m, y_m)
+            else:
+                if cfg.loss_name == "hybrid":
+                    loss = cfg.l1_weight * nn.functional.l1_loss(pred, y_vec) + \
+                        (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
+                else:
+                    loss = base_loss_fn(pred, y_vec)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_clip()
             optimizer.step()
             train_losses.append(loss.item())
 
+        # Step LR scheduler once per epoch (cosine annealing)
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+
         if use_early_stop:
             model.eval()
             val_losses = []
             with torch.no_grad():
                 for x_vec, y_vec in va_loader:
-                    a = vec_to_adj(x_vec, cfg.n_lr, vectorizer)
-                    pred = model(a, a)
+                    n_lr_e_full = cfg.n_lr * (cfg.n_lr - 1) // 2
+                    if cfg.lap_pe_dim > 0:
+                        adj_vec = x_vec[:, :n_lr_e_full]
+                        pe_vec  = x_vec[:, n_lr_e_full:].reshape(x_vec.size(0), cfg.n_lr, cfg.lap_pe_dim)
+                        a = vec_to_adj(adj_vec, cfg.n_lr, vectorizer)
+                        pred = model(a, a, pe_vec)
+                    else:
+                        a = vec_to_adj(x_vec, cfg.n_lr, vectorizer)
+                        pred = model(a, a)
                     if cfg.loss_name == "hybrid":
                         v = cfg.l1_weight * nn.functional.l1_loss(pred, y_vec) + (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
                     else:
@@ -694,18 +1228,35 @@ def predict_vectors(
     vectorizer: MatrixVectorizer,
     batch_size: int,
     n_lr: int,
+    y_mean: np.ndarray | None = None,
+    lap_pe_dim: int = 0,
 ) -> np.ndarray:
+    """Run inference for all subjects. If y_mean is given, add it back (residual mode).
+
+    When lap_pe_dim > 0, x_np is expected to be (N, n_lr_e + n_lr*lap_pe_dim) — the
+    adjacency vector concatenated with the flattened Laplacian PE.
+    """
+    n_lr_e = n_lr * (n_lr - 1) // 2
     model.eval()
     outputs = []
 
     with torch.no_grad():
         for start in range(0, len(x_np), batch_size):
             x_batch = torch.from_numpy(x_np[start:start + batch_size]).float().to(device)
-            a = vec_to_adj(x_batch, n_lr, vectorizer)
-            pred = model(a, a)
+            if lap_pe_dim > 0:
+                adj_batch = x_batch[:, :n_lr_e]
+                pe_batch  = x_batch[:, n_lr_e:].reshape(x_batch.size(0), n_lr, lap_pe_dim)
+                a = vec_to_adj(adj_batch, n_lr, vectorizer)
+                pred = model(a, a, pe_batch)
+            else:
+                a = vec_to_adj(x_batch, n_lr, vectorizer)
+                pred = model(a, a)
             outputs.append(pred.cpu().numpy())
 
-    return np.concatenate(outputs, axis=0)
+    result = np.concatenate(outputs, axis=0)
+    if y_mean is not None:
+        result = result + y_mean[np.newaxis, :]  # add per-edge mean back for residual mode
+    return result
 
 
 def vectors_to_matrices(vecs: np.ndarray, n: int, vectorizer: MatrixVectorizer) -> np.ndarray:
@@ -742,6 +1293,16 @@ def run_cv(args: argparse.Namespace) -> None:
         hr_refine_layers=args.hr_refine_layers,
         edge_scale=getattr(args, "edge_scale", 0.2),
         bipartite_layers=getattr(args, "bipartite_layers", 1),
+        use_residual=getattr(args, "use_residual", False),
+        mixup_alpha=getattr(args, "mixup_alpha", 0.0),
+        subject_scale=getattr(args, "subject_scale", False),
+        calibrate=getattr(args, "calibrate", False),
+        lap_pe_dim=getattr(args, "lap_pe_dim", 0),
+        pearl_pe_dim=getattr(args, "pearl_pe_dim", 0),
+        lr_schedule=getattr(args, "lr_schedule", "plateau"),
+        lr_min=getattr(args, "lr_min", 1e-6),
+        curriculum_phase_epochs=getattr(args, "curriculum_phase_epochs", 0),
+        curriculum_heavy_percentile=getattr(args, "curriculum_heavy_percentile", 50.0),
     )
 
     seed_everything(cfg.seed)
@@ -757,7 +1318,24 @@ def run_cv(args: argparse.Namespace) -> None:
     print(f"Train LR: {x_train.shape} | Train HR: {y_train.shape}")
     print(f"Config: {asdict(cfg)}")
 
+    # --- Per-subject scale normalisation ---
+    subj_scales_lr: np.ndarray | None = None
+    if cfg.subject_scale:
+        subj_scales_lr = compute_subject_scales(x_train)  # (N, 1), based on LR std
+        x_train = apply_subject_scale(x_train, subj_scales_lr)
+        y_train = apply_subject_scale(y_train, subj_scales_lr)  # same scale for HR
+        print(f"  Subject-scale normalisation enabled. LR scale mean={subj_scales_lr.mean():.4f}, "
+              f"min={subj_scales_lr.min():.4f}, max={subj_scales_lr.max():.4f}")
+
     vectorizer = MatrixVectorizer()
+
+    # --- Laplacian PE: precompute once for all training subjects (before splitting folds) ---
+    if cfg.lap_pe_dim > 0:
+        print(f"  Precomputing Laplacian PE (k={cfg.lap_pe_dim}) for {len(x_train)} subjects ...")
+        lap_pe_train = compute_lap_pe(x_train, cfg.n_lr, cfg.lap_pe_dim, vectorizer)
+        x_train = np.concatenate([x_train, lap_pe_train], axis=1)  # (N, n_lr_e + n_lr*k)
+        print(f"  x_train shape with LapPE: {x_train.shape}")
+
     kf = KFold(n_splits=cfg.num_folds, shuffle=True, random_state=cfg.seed)
 
     progress_path = out_dir / "cv_progress.json"
@@ -806,6 +1384,8 @@ def run_cv(args: argparse.Namespace) -> None:
             metric_cache.unlink()
 
         fold_t0 = time.perf_counter()
+        # Compute per-fold HR mean for residual learning (training split only — no leakage)
+        y_mean_fold = y_train[tr_idx].mean(axis=0) if cfg.use_residual else None
         model, best_val, best_epoch = train_with_validation(
             cfg,
             device,
@@ -815,6 +1395,7 @@ def run_cv(args: argparse.Namespace) -> None:
             x_train[va_idx],
             y_train[va_idx],
             fold_id,
+            y_mean=y_mean_fold,
         )
         fold_elapsed = time.perf_counter() - fold_t0
         fold_seconds.append(fold_elapsed)
@@ -834,9 +1415,24 @@ def run_cv(args: argparse.Namespace) -> None:
 
         print(f"  Computing metrics for fold {fold_id} ...")
         pred_vecs = predict_vectors(
-            model, x_train[va_idx], device, vectorizer, cfg.batch_size, cfg.n_lr
+            model, x_train[va_idx], device, vectorizer, cfg.batch_size, cfg.n_lr,
+            y_mean=y_mean_fold, lap_pe_dim=cfg.lap_pe_dim,
         )
         gt_vecs = y_train[va_idx]
+
+        # --- Un-scale predictions and GT back to original edge-weight units ---
+        cal_slope: float | None = None
+        cal_intercept: float | None = None
+        if cfg.subject_scale and subj_scales_lr is not None:
+            va_scales = subj_scales_lr[va_idx]  # (val_N, 1)
+            pred_vecs = pred_vecs * va_scales
+            gt_vecs   = gt_vecs  * va_scales
+
+        # --- Post-hoc linear calibration (fit on val fold, apply to val fold) ---
+        if cfg.calibrate:
+            cal_slope, cal_intercept = fit_calibration(pred_vecs, gt_vecs)
+            pred_vecs = apply_calibration(pred_vecs, cal_slope, cal_intercept)
+            print(f"  Calibration | slope={cal_slope:.6f}, intercept={cal_intercept:.6f}")
 
         pred_mats = vectors_to_matrices(pred_vecs, cfg.n_hr, vectorizer)
         gt_mats = vectors_to_matrices(gt_vecs, cfg.n_hr, vectorizer)
@@ -859,6 +1455,7 @@ def run_cv(args: argparse.Namespace) -> None:
                 "fold_seconds": float(fold_elapsed),
                 "checkpoint": str(fold_ckpt),
                 "metrics": metrics,
+                **({"cal_slope": cal_slope, "cal_intercept": cal_intercept} if cal_slope is not None else {}),
             }
         )
 
@@ -934,6 +1531,16 @@ def run_full(args: argparse.Namespace) -> None:
         hr_refine_layers=args.hr_refine_layers,
         edge_scale=getattr(args, "edge_scale", 0.2),
         bipartite_layers=getattr(args, "bipartite_layers", 1),
+        use_residual=getattr(args, "use_residual", False),
+        mixup_alpha=getattr(args, "mixup_alpha", 0.0),
+        subject_scale=getattr(args, "subject_scale", False),
+        calibrate=getattr(args, "calibrate", False),
+        lap_pe_dim=getattr(args, "lap_pe_dim", 0),
+        pearl_pe_dim=getattr(args, "pearl_pe_dim", 0),
+        lr_schedule=getattr(args, "lr_schedule", "plateau"),
+        lr_min=getattr(args, "lr_min", 1e-6),
+        curriculum_phase_epochs=getattr(args, "curriculum_phase_epochs", 0),
+        curriculum_heavy_percentile=getattr(args, "curriculum_heavy_percentile", 50.0),
     )
 
     device = get_device(args.device)
@@ -944,13 +1551,38 @@ def run_full(args: argparse.Namespace) -> None:
     submission_path.parent.mkdir(parents=True, exist_ok=True)
 
     x_train, y_train, x_test = load_data(data_dir)
+    y_mean_pop = y_train.mean(axis=0).astype(np.float32)  # for inference shrinkage (before subject_scale)
+    shrinkage_eps = getattr(args, "shrinkage_eps", 0.0)
+    if shrinkage_eps > 0:
+        print(f"Shrinkage: eps={shrinkage_eps} (pred = (1-eps)*pred + eps*train_mean)")
     print(f"Device: {device}")
     print(f"Train LR: {x_train.shape} | Train HR: {y_train.shape} | Test LR: {x_test.shape}")
     print(f"Config: {asdict(cfg)}")
     if len(seeds) > 1:
         print(f"Ensemble mode: {len(seeds)} seeds {seeds}")
 
+    # --- Per-subject scale normalisation (full-retrain mode) ---
+    subj_scales_train: np.ndarray | None = None
+    subj_scales_test:  np.ndarray | None = None
+    if cfg.subject_scale:
+        subj_scales_train = compute_subject_scales(x_train)
+        subj_scales_test  = compute_subject_scales(x_test)
+        x_train = apply_subject_scale(x_train, subj_scales_train)
+        y_train = apply_subject_scale(y_train, subj_scales_train)  # same LR scale for HR
+        x_test  = apply_subject_scale(x_test,  subj_scales_test)
+        print(f"  Subject-scale enabled. Train scale: mean={subj_scales_train.mean():.4f}, "
+              f"Test scale: mean={subj_scales_test.mean():.4f}")
+
     vectorizer = MatrixVectorizer()
+
+    # --- Laplacian PE: precompute once for train and test ---
+    if cfg.lap_pe_dim > 0:
+        print(f"  Precomputing Laplacian PE (k={cfg.lap_pe_dim}) for {len(x_train)} train + {len(x_test)} test subjects ...")
+        lap_pe_train = compute_lap_pe(x_train, cfg.n_lr, cfg.lap_pe_dim, vectorizer)
+        lap_pe_test  = compute_lap_pe(x_test,  cfg.n_lr, cfg.lap_pe_dim, vectorizer)
+        x_train = np.concatenate([x_train, lap_pe_train], axis=1)
+        x_test  = np.concatenate([x_test,  lap_pe_test],  axis=1)
+        print(f"  x_train/x_test shape with LapPE: {x_train.shape} / {x_test.shape}")
     peak_ram = current_ram_gb()
     train_start = time.perf_counter()
     max_epochs = getattr(args, "max_epochs", 400)
@@ -975,10 +1607,17 @@ def run_full(args: argparse.Namespace) -> None:
             if i == 0:
                 print(f"Full retrain: train {x_tr.shape[0]}, val {x_va.shape[0]} (early stopping patience={patience})")
 
+        # Compute HR mean for residual learning (from training split only, not val)
+        y_mean_full = y_tr.mean(axis=0) if cfg.use_residual else None
+        if y_mean_full is not None and i == 0:
+            print(f"  Residual mode: subtracting per-edge HR mean (mean={y_mean_full.mean():.4f})")
+
         fold_train_start = time.perf_counter()
         full_model = train_full(
             cfg, device, vectorizer, x_tr, y_tr,
-            max_epochs=max_epochs, x_va=x_va, y_va=y_va, patience=patience if (x_va is not None) else None,
+            max_epochs=max_epochs, x_va=x_va, y_va=y_va,
+            patience=patience if (x_va is not None) else None,
+            y_mean=y_mean_full,
         )
         total_train_seconds += time.perf_counter() - fold_train_start
 
@@ -986,11 +1625,52 @@ def run_full(args: argparse.Namespace) -> None:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"model": full_model.state_dict(), "config": asdict(cfg)}, checkpoint_path)
 
-        preds = predict_vectors(full_model, x_test, device, vectorizer, cfg.batch_size, cfg.n_lr)
+        preds = predict_vectors(full_model, x_test, device, vectorizer, cfg.batch_size, cfg.n_lr,
+                                y_mean=y_mean_full, lap_pe_dim=cfg.lap_pe_dim)
         preds = np.clip(preds, a_min=0.0, a_max=None)
+
+        # Post-hoc bias correction: subtract mean(pred-gt) on val from test preds (same space)
+        if getattr(args, "bias_correct", False) and x_va is not None and y_va is not None:
+            val_preds = predict_vectors(full_model, x_va, device, vectorizer, cfg.batch_size, cfg.n_lr,
+                                       y_mean=y_mean_full, lap_pe_dim=cfg.lap_pe_dim)
+            bias = compute_bias_correction(val_preds, y_va)
+            preds = preds - bias[np.newaxis, :]
+            preds = np.clip(preds, a_min=0.0, a_max=None)
+            print(f"  Bias correction | mean(bias)={bias.mean():.6f}, std(bias)={bias.std():.6f}")
+
+        # Un-scale test predictions back to original edge-weight units
+        if cfg.subject_scale and subj_scales_test is not None:
+            preds = preds * subj_scales_test
+
+        # Post-hoc calibration: fit on val holdout, apply to test
+        if cfg.calibrate and x_va is not None and y_va is not None:
+            # Predict on val holdout (already scaled) to fit calibration
+            val_preds = predict_vectors(full_model, x_va, device, vectorizer, cfg.batch_size, cfg.n_lr,
+                                       y_mean=y_mean_full, lap_pe_dim=cfg.lap_pe_dim)
+            val_gt = y_va
+            if cfg.subject_scale and subj_scales_train is not None:
+                # reconstruct val subject indices (train_test_split breaks index continuity)
+                # val_gt is already in scaled space; un-scale for calibration in original units
+                val_preds_cal = val_preds  # will un-scale below
+                # We need the scales for the val subjects; since train_test_split shuffles,
+                # we work in the scaled space (consistent model input/output basis)
+                # Calibration in scaled space, un-scale after applying
+                cal_slope_full, cal_intercept_full = fit_calibration(val_preds_cal, val_gt)
+                cal_scales = subj_scales_test  # test scales for un-scaling after calibration
+                # Apply calibration in scaled space then un-scale
+                preds_scaled = preds / subj_scales_test  # re-scale test preds temporarily
+                preds_scaled = apply_calibration(preds_scaled, cal_slope_full, cal_intercept_full)
+                preds = preds_scaled * subj_scales_test   # un-scale again
+            else:
+                cal_slope_full, cal_intercept_full = fit_calibration(val_preds, val_gt)
+                preds = apply_calibration(preds, cal_slope_full, cal_intercept_full)
+            print(f"  Full-retrain calibration | slope={cal_slope_full:.6f}, intercept={cal_intercept_full:.6f}")
+
         preds_list.append(preds)
 
     preds = np.mean(preds_list, axis=0)
+    if shrinkage_eps > 0:
+        preds = (1 - shrinkage_eps) * preds + shrinkage_eps * y_mean_pop[np.newaxis, :]
     preds = np.clip(preds, a_min=0.0, a_max=1.0)
     assert preds.shape[1] == HR_FEATURES, f"Expected {HR_FEATURES} HR features, got {preds.shape[1]}"
 
@@ -1039,13 +1719,14 @@ def run_full(args: argparse.Namespace) -> None:
 
 
 def run_tune(args: argparse.Namespace) -> None:
-    """Optuna Bayesian optimization over DenseGAT hyperparams on 3-fold CV. Resumable via SQLite."""
+    """Optuna Bayesian optimization on 3-fold CV. Supports v3r (DenseGCN) and v4 (DenseGAT). Resumable via SQLite."""
     if optuna is None:
         raise ImportError("Optuna is required for tune mode. Install with: pip install optuna")
 
     args = apply_preset(args)
-    if args.model != "dense_gat":
-        print("Tune mode is for dense_gat. Use --preset v4 or --model dense_gat.")
+    tune_v3r = args.preset == "v3r" or (args.model == "dense_gcn" and args.preset in ("v3r", "v3"))
+    if not tune_v3r and args.model != "dense_gat":
+        print("Tune mode: use --preset v3r for DenseGCN or --preset v4 for DenseGAT.")
         args.model = "dense_gat"
 
     out_dir = Path(args.out_dir)
@@ -1062,7 +1743,7 @@ def run_tune(args: argparse.Namespace) -> None:
     vectorizer = MatrixVectorizer()
     kf = KFold(n_splits=args.num_folds, shuffle=True, random_state=args.seed)
 
-    def objective(trial: "optuna.Trial") -> float:
+    def objective_gat(trial: "optuna.Trial") -> float:
         edge_scale = trial.suggest_float("edge_scale", 0.1, 0.5)
         hr_refine_layers = trial.suggest_int("hr_refine_layers", 0, 1)
         dropout = trial.suggest_float("dropout", 0.1, 0.4)
@@ -1092,6 +1773,7 @@ def run_tune(args: argparse.Namespace) -> None:
             num_decoder_heads=4,
             hr_refine_layers=hr_refine_layers,
             edge_scale=edge_scale,
+            pearl_pe_dim=getattr(args, "pearl_pe_dim", 0),
         )
         fold_vals = []
         for fold_id, (tr_idx, va_idx) in enumerate(kf.split(x_train), start=1):
@@ -1106,6 +1788,57 @@ def run_tune(args: argparse.Namespace) -> None:
         trial.set_user_attr("fold_vals", fold_vals)
         return mean_val
 
+    def objective_v3r(trial: "optuna.Trial") -> float:
+        lr = trial.suggest_float("lr", 5e-4, 1.5e-3, log=True)
+        dropout = trial.suggest_float("dropout", 0.25, 0.45)
+        hidden_dim = trial.suggest_categorical("hidden_dim", [128, 192, 256])
+        num_layers = trial.suggest_int("num_layers", 3, 4)
+        mixup_alpha = trial.suggest_float("mixup_alpha", 0.1, 0.3)
+        cfg = TrainConfig(
+            model_name="dense_gcn",
+            n_lr=N_LR,
+            n_hr=N_HR,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            epochs=args.epochs,
+            patience=args.patience,
+            batch_size=args.batch_size,
+            learning_rate=lr,
+            weight_decay=args.weight_decay,
+            loss_name="l1",
+            huber_beta=1.0,
+            l1_weight=0.7,
+            seed=args.seed,
+            num_folds=args.num_folds,
+            use_residual=True,
+            mixup_alpha=mixup_alpha,
+            num_heads=4,
+            ffn_mult=4,
+            num_decoder_heads=4,
+            hr_refine_layers=1,
+            edge_scale=0.2,
+            lap_pe_dim=0,
+            pearl_pe_dim=0,
+        )
+        fold_vals = []
+        for fold_id, (tr_idx, va_idx) in enumerate(kf.split(x_train), start=1):
+            y_mean_fold = y_train[tr_idx].mean(axis=0)
+            _, best_val, _ = train_with_validation(
+                cfg, device, vectorizer,
+                x_train[tr_idx], y_train[tr_idx],
+                x_train[va_idx], y_train[va_idx],
+                fold_id,
+                y_mean=y_mean_fold,
+            )
+            fold_vals.append(best_val)
+        mean_val = float(np.mean(fold_vals))
+        trial.set_user_attr("fold_vals", fold_vals)
+        return mean_val
+
+    objective = objective_v3r if tune_v3r else objective_gat
+    study_name = "v3r_tune" if tune_v3r else "dense_gat_tune"
+
     if fresh and storage_path.exists():
         storage_path.unlink()
         print("Fresh run: cleared Optuna study.")
@@ -1114,23 +1847,36 @@ def run_tune(args: argparse.Namespace) -> None:
         direction="minimize",
         storage=storage_url,
         load_if_exists=not fresh,
-        study_name="dense_gat_tune",
+        study_name=study_name,
     )
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
     best_params = study.best_params
     best_mean_val = study.best_value
-    best_config = {
-        "model_name": "dense_gat",
-        "n_lr": N_LR,
-        "n_hr": N_HR,
-        "hidden_dim": best_params["hidden_dim"],
-        "num_layers": best_params["num_layers"],
-        "dropout": best_params["dropout"],
-        "learning_rate": best_params["lr"],
-        "edge_scale": best_params["edge_scale"],
-        "hr_refine_layers": best_params["hr_refine_layers"],
-    }
+    if tune_v3r:
+        best_config = {
+            "model_name": "dense_gcn",
+            "n_lr": N_LR,
+            "n_hr": N_HR,
+            "hidden_dim": best_params["hidden_dim"],
+            "num_layers": best_params["num_layers"],
+            "dropout": best_params["dropout"],
+            "learning_rate": best_params["lr"],
+            "use_residual": True,
+            "mixup_alpha": best_params["mixup_alpha"],
+        }
+    else:
+        best_config = {
+            "model_name": "dense_gat",
+            "n_lr": N_LR,
+            "n_hr": N_HR,
+            "hidden_dim": best_params["hidden_dim"],
+            "num_layers": best_params["num_layers"],
+            "dropout": best_params["dropout"],
+            "learning_rate": best_params["lr"],
+            "edge_scale": best_params["edge_scale"],
+            "hr_refine_layers": best_params["hr_refine_layers"],
+        }
     all_results = [
         {"params": t.params, "value": t.value}
         for t in study.trials
@@ -1159,43 +1905,79 @@ def run_tune(args: argparse.Namespace) -> None:
         submission_path.parent.mkdir(parents=True, exist_ok=True)
         val_ratio = 0.15
         patience_full = 50
-        max_epochs_full = 400
+        max_epochs_full = 600 if tune_v3r else 400
         print(f"\n--full-retrain: running full retrain with best config (val_ratio={val_ratio}, patience={patience_full}, max_epochs={max_epochs_full}) -> {submission_path}")
-        cfg = TrainConfig(
-            model_name="dense_gat",
-            n_lr=N_LR,
-            n_hr=N_HR,
-            hidden_dim=best_params["hidden_dim"],
-            num_layers=best_params["num_layers"],
-            dropout=best_params["dropout"],
-            epochs=args.epochs,
-            patience=args.patience,
-            batch_size=args.batch_size,
-            learning_rate=best_params["lr"],
-            weight_decay=args.weight_decay,
-            loss_name=args.loss,
-            huber_beta=args.huber_beta,
-            l1_weight=args.l1_weight,
-            seed=args.seed,
-            num_folds=args.num_folds,
-            num_heads=args.num_heads,
-            ffn_mult=args.ffn_mult,
-            num_decoder_heads=4,
-            hr_refine_layers=best_params["hr_refine_layers"],
-            edge_scale=best_params["edge_scale"],
-        )
+        if tune_v3r:
+            cfg = TrainConfig(
+                model_name="dense_gcn",
+                n_lr=N_LR,
+                n_hr=N_HR,
+                hidden_dim=best_params["hidden_dim"],
+                num_layers=best_params["num_layers"],
+                dropout=best_params["dropout"],
+                epochs=args.epochs,
+                patience=args.patience,
+                batch_size=args.batch_size,
+                learning_rate=best_params["lr"],
+                weight_decay=args.weight_decay,
+                loss_name="l1",
+                huber_beta=1.0,
+                l1_weight=0.7,
+                seed=args.seed,
+                num_folds=args.num_folds,
+                use_residual=True,
+                mixup_alpha=best_params["mixup_alpha"],
+                num_heads=4,
+                ffn_mult=4,
+                num_decoder_heads=4,
+                hr_refine_layers=1,
+                edge_scale=0.2,
+                lap_pe_dim=0,
+                pearl_pe_dim=0,
+            )
+        else:
+            cfg = TrainConfig(
+                model_name="dense_gat",
+                n_lr=N_LR,
+                n_hr=N_HR,
+                hidden_dim=best_params["hidden_dim"],
+                num_layers=best_params["num_layers"],
+                dropout=best_params["dropout"],
+                epochs=args.epochs,
+                patience=args.patience,
+                batch_size=args.batch_size,
+                learning_rate=best_params["lr"],
+                weight_decay=args.weight_decay,
+                loss_name=args.loss,
+                huber_beta=args.huber_beta,
+                l1_weight=args.l1_weight,
+                seed=args.seed,
+                num_folds=args.num_folds,
+                num_heads=args.num_heads,
+                ffn_mult=args.ffn_mult,
+                num_decoder_heads=4,
+                hr_refine_layers=best_params["hr_refine_layers"],
+                edge_scale=best_params["edge_scale"],
+                pearl_pe_dim=getattr(args, "pearl_pe_dim", 0),
+            )
         x_train, y_train, x_test = load_data(data_dir)
+        y_mean_pop = y_train.mean(axis=0).astype(np.float32)
+        shrinkage_eps = getattr(args, "shrinkage_eps", 0.05)
         x_tr, x_va, y_tr, y_va = train_test_split(
             x_train, y_train, test_size=val_ratio, random_state=cfg.seed, shuffle=True
         )
+        y_mean_full = y_tr.mean(axis=0) if cfg.use_residual else None
         full_model = train_full(
             cfg, device, vectorizer, x_tr, y_tr,
             max_epochs=max_epochs_full, x_va=x_va, y_va=y_va, patience=patience_full,
+            y_mean=y_mean_full,
         )
         ckpt_path = out_dir / "checkpoints" / "full_model_best_tune.pt"
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"model": full_model.state_dict(), "config": asdict(cfg)}, ckpt_path)
-        preds = predict_vectors(full_model, x_test, device, vectorizer, cfg.batch_size, cfg.n_lr)
+        preds = predict_vectors(full_model, x_test, device, vectorizer, cfg.batch_size, cfg.n_lr, y_mean=y_mean_full)
+        if shrinkage_eps > 0:
+            preds = (1 - shrinkage_eps) * preds + shrinkage_eps * y_mean_pop[np.newaxis, :]
         preds = np.clip(preds, a_min=0.0, a_max=None)
         assert preds.shape[1] == HR_FEATURES, f"Expected {HR_FEATURES} HR features, got {preds.shape[1]}"
         n_subjects, n_features = preds.shape

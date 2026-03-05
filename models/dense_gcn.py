@@ -59,13 +59,25 @@ class DenseGCNGenerator(nn.Module):
         hidden_dim: int = 256,
         num_layers: int = 3,
         dropout: float = 0.3,
+        raw_output: bool = False,
+        lap_pe_dim: int = 0,
+        pearl_pe_dim: int = 0,
     ):
         super().__init__()
         self.n_lr = n_lr
         self.n_hr = n_hr
+        self.raw_output = raw_output
+        self.lap_pe_dim = lap_pe_dim
+        self.pearl_pe_dim = pearl_pe_dim
+
+        input_dim = n_lr + lap_pe_dim + pearl_pe_dim  # adjacency rows + optional Laplacian PE + PEARL PE
+        
+        if self.pearl_pe_dim > 0:
+            self.pearl_pe = nn.Parameter(torch.empty(1, n_lr, pearl_pe_dim))
+            nn.init.normal_(self.pearl_pe, mean=0.0, std=0.02)
 
         self.input_proj = nn.Sequential(
-            nn.Linear(n_lr, hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -100,15 +112,25 @@ class DenseGCNGenerator(nn.Module):
         D_inv_sqrt = torch.diag_embed(deg.pow(-0.5))
         return D_inv_sqrt @ A_hat @ D_inv_sqrt
 
-    def forward(self, A_lr: torch.Tensor, X_lr: torch.Tensor) -> torch.Tensor:
+    def forward(self, A_lr: torch.Tensor, X_lr: torch.Tensor, lap_pe: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
-            A_lr: (B, n_lr, n_lr) weighted symmetric adjacency
-            X_lr: (B, n_lr, n_lr) node features = adjacency rows
+            A_lr:   (B, n_lr, n_lr) weighted symmetric adjacency
+            X_lr:   (B, n_lr, n_lr) node features = adjacency rows
+            lap_pe: (B, n_lr, lap_pe_dim) optional Laplacian eigenvector PE; None = disabled
         Returns:
             pred: (B, n_hr*(n_hr-1)/2) predicted HR edge-weight vector
         """
         S = self._normalise(A_lr)
+
+        # Concatenate Laplacian PE to node features before projection
+        if lap_pe is not None and self.lap_pe_dim > 0:
+            X_lr = torch.cat([X_lr, lap_pe], dim=-1)  # (B, n_lr, n_lr + lap_pe_dim)
+            
+        # Concatenate PEARL learnable PE
+        if self.pearl_pe_dim > 0:
+            pearl_feat = self.pearl_pe.expand(A_lr.size(0), -1, -1) # (B, n_lr, pearl_pe_dim)
+            X_lr = torch.cat([X_lr, pearl_feat], dim=-1)
 
         H = self.input_proj(X_lr)                       # (B, n_lr, hidden_dim)
 
@@ -125,4 +147,6 @@ class DenseGCNGenerator(nn.Module):
 
         idx = self._get_triu_indices(A.device)
         pred = A[:, idx[0], idx[1]]                      # (B, 35778)
+        if self.raw_output:
+            return pred  # residual mode: caller adds y_mean back; can be negative
         return torch.nn.functional.softplus(pred)  # non-negative + gradient flow

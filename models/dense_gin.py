@@ -31,15 +31,15 @@ class DenseGINBlock(nn.Module):
         )
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, A: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
+    def forward(self, S: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            A: (B, N, N) weighted adjacency (no normalisation)
+            S: (B, N, N) symmetrically-normalised adjacency D^{-1/2}(A+I)D^{-1/2}
             H: (B, N, dim) node representations
         Returns:
             H': (B, N, dim) updated node representations
         """
-        agg = (1.0 + self.epsilon) * H + A @ H
+        agg = (1.0 + self.epsilon) * H + S @ H  # degree-normalised aggregation
         out = self.mlp(agg)
         out = self.drop(out)
         return out + H
@@ -58,10 +58,12 @@ class DenseGINGenerator(nn.Module):
         hidden_dim: int = 192,
         num_layers: int = 3,
         dropout: float = 0.35,
+        raw_output: bool = False,
     ):
         super().__init__()
         self.n_lr = n_lr
         self.n_hr = n_hr
+        self.raw_output = raw_output
 
         self.input_proj = nn.Sequential(
             nn.Linear(n_lr, hidden_dim),
@@ -89,6 +91,16 @@ class DenseGINGenerator(nn.Module):
             )
         return self._triu_idx
 
+    @staticmethod
+    def _normalise(A: torch.Tensor) -> torch.Tensor:
+        """S = D^{-1/2} (A + I) D^{-1/2}  (same as DenseGCN normalisation)."""
+        N = A.size(-1)
+        I = torch.eye(N, device=A.device, dtype=A.dtype).unsqueeze(0)
+        A_hat = A + I
+        deg = A_hat.sum(dim=-1).clamp(min=1e-8)
+        D_inv_sqrt = torch.diag_embed(deg.pow(-0.5))
+        return D_inv_sqrt @ A_hat @ D_inv_sqrt
+
     def forward(self, A_lr: torch.Tensor, X_lr: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -97,10 +109,11 @@ class DenseGINGenerator(nn.Module):
         Returns:
             pred: (B, n_hr*(n_hr-1)/2) predicted HR edge-weight vector
         """
+        S = self._normalise(A_lr)   # symmetrically-normalised adjacency
         H = self.input_proj(X_lr)
 
         for layer in self.gin_layers:
-            H = layer(A_lr, H)
+            H = layer(S, H)         # pass S, not raw A
 
         H = self.upsample(H.transpose(1, 2)).transpose(1, 2)
         H = self.decoder_norm(H)
@@ -110,5 +123,6 @@ class DenseGINGenerator(nn.Module):
         A_pred = 0.5 * (HP @ HP.transpose(1, 2) + (HP @ HP.transpose(1, 2)).transpose(1, 2))
         idx = self._get_triu_indices(A_pred.device)
         pred = A_pred[:, idx[0], idx[1]]
-        pred = F.softplus(pred)
-        return pred.clamp(min=0.0, max=1.0)
+        if self.raw_output:
+            return pred  # residual mode: caller adds y_mean back; can be negative
+        return F.softplus(pred).clamp(min=0.0, max=1.0)

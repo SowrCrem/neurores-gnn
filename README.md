@@ -63,6 +63,32 @@ neurores-gnn/
 
 ---
 
+## TODO: Manual cleanup (files not needed for Kaggle submission)
+
+The following files/directories are **not required** to produce a submission CSV. They can be removed or archived to slim the repo before sharing or packaging.
+
+| Path | Why not needed |
+|------|----------------|
+| `docs/` | Planning, analysis, and path docs (PATH_TO_0_126, RESEARCH_ANALYSIS_REPORT, etc.). Used for development only. |
+| `notebooks/` | Exploratory notebooks (dense_gcn_analysis, devec_check, sgc_baseline_v2, etc.). Canonical workflow is `src/train_dense_gcn.py`. |
+| `scripts/` | Auxiliary scripts (`postprocess_submission.py`, `graph_statistics_analysis.py`). Not used by the main training/inference pipeline. |
+| `gcn-encoder-ca-decoder/` | Separate baseline implementation. Not imported by `train_dense_gcn.py`. |
+| `configs/` | `base_model.yaml` is used by legacy `src/train.py`, not by `train_dense_gcn.py`. |
+| `src/train.py` | Legacy training script. Superseded by `src/train_dense_gcn.py`. |
+| `src/dataset.py` | Used by legacy `train.py`. `train_dense_gcn` loads CSV directly. |
+| `src/inference.py` | Standalone inference module. `train_dense_gcn` has its own predict logic. |
+| `models/generator.py`, `models/layers.py` | Legacy BrainGNN (DGL-based). Not used by dense GCN/GAT/Bi-SR pipeline. |
+| `models/sgc_baseline.py` | SGC baseline. Not used by `train_dense_gcn` (different entry point). |
+| `models/vgae.py` | VGAE baseline. Not used by main pipeline. |
+| `models/bipartite.py` | Standalone bipartite impl. Bi-SR uses `models/dense_bisr.py` instead. |
+| `utils/dgl_compat.py` | DGL compatibility shim. Not used by `train_dense_gcn`. |
+| `utils/graph_utils.py` | DGL graph helpers. Not used by dense pipeline. |
+| `utils/example.py` | Example script. Not part of submission flow. |
+
+**Minimal submission set:** `src/train_dense_gcn.py`, `models/dense_*.py` (dense_gcn, dense_gat, dense_bisr, dense_gin, dense_gcn_ca, dense_gcn_gps, dense_gcn_lrs, dense_graphsage, dense_stp), `utils/matrix_vectorizer.py`, `utils/metrics.py`, `utils/plotting.py`, `requirements.txt`.
+
+---
+
 ## 🗺️ Implementation Order
 
 ### Phase 1 ✅ — Metrics & infrastructure

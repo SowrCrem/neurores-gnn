@@ -110,6 +110,7 @@ class TrainConfig:
     edge_dropout: float = 0.0         # LR edge dropout prob (0.05–0.15); forces robustness to missing edges
     gaussian_noise_std: float = 0.0   # Add N(0, std) to LR adjacency (0.01–0.05); clamp to [0,1]
     mixup_prob: float = 0.5           # Probability of applying mixup when alpha > 0 (default 0.5)
+    edge_weight_mode: str = "none"    # Per-edge loss weighting: "none", "mean", "sqrt_mean" (heavier edges weighted more)
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,7 +122,7 @@ def parse_args() -> argparse.Namespace:
     def add_shared(p: argparse.ArgumentParser) -> None:
         p.add_argument("--data-dir", type=str, default=DEFAULT_DATA_DIR)
         p.add_argument("--out-dir", type=str, default=DEFAULT_OUT_DIR)
-        p.add_argument("--preset", type=str, default="v2", choices=["v2", "v3", "v3r", "v3r_eb", "v3r_eb_ffnn", "v3r_eb_ffnn_aug", "v3r_eb_ffnn_spec", "v3sn", "v3r_pe", "v3r_lrs", "v3r_cos", "v4", "v5", "bisr", "bisr_v2", "bisr_v3r", "gcn_ca", "gin", "gin_n", "gin_v3r", "gps", "gps_v3r", "graphsage", "sage_v3r", "stp", "stp_pe"])
+        p.add_argument("--preset", type=str, default="v2", choices=["v2", "v3", "v3r", "v3r_eb", "v3r_eb_ffnn", "v3r_eb_ffnn_aug", "v3r_eb_ffnn_aug_light", "v3r_eb_ffnn_spec", "v3r_eb_ffnn_edgeweight", "v3r_eb_ffnn_shrink", "v3sn", "v3r_pe", "v3r_lrs", "v3r_cos", "v4", "v5", "bisr", "bisr_v2", "bisr_v3r", "gcn_ca", "gin", "gin_n", "gin_v3r", "gps", "gps_v3r", "graphsage", "sage_v3r", "stp", "stp_pe"])
         p.add_argument("--model", type=str, default="dense_gcn", choices=["dense_gcn", "dense_gat", "dense_bisr", "dense_gcn_ca", "dense_gin", "dense_gcn_gps", "dense_gcn_lrs", "dense_graphsage", "dense_stp"])
         p.add_argument("--seed", type=int, default=42)
         p.add_argument("--epochs", type=int, default=400)
@@ -176,6 +177,9 @@ def parse_args() -> argparse.Namespace:
                        help="Add N(0,std) to LR adjacency (0=disabled, 0.01-0.05); clamp to [0,1]")
         p.add_argument("--mixup-prob", type=float, default=0.5,
                        help="Probability of applying mixup when alpha>0 (default 0.5)")
+        p.add_argument("--edge-weight-mode", type=str, default="none",
+                       choices=["none", "mean", "sqrt_mean"],
+                       help="Per-edge loss weighting: mean/sqrt_mean weight heavier edges more")
 
     cv = sub.add_parser("cv", help="Run 3-fold CV and log metrics/resources.")
     add_shared(cv)
@@ -218,6 +222,8 @@ def parse_args() -> argparse.Namespace:
     )
     full.add_argument("--bias-correct", action="store_true", default=False,
                       help="Post-hoc bias: subtract mean(pred-gt) on val from test preds. Requires val-ratio>0.")
+    full.add_argument("--learn-shrinkage", action="store_true", default=False,
+                      help="Learn per-edge shrinkage on val set (minimize MAE) instead of fixed eps. Requires val-ratio>0.")
 
     tune = sub.add_parser("tune", help="Hyperparameter tuning: Optuna Bayesian optimization on 3-fold CV.")
     add_shared(tune)
@@ -680,6 +686,50 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
             "edge_dropout": 0.08,
             "gaussian_noise_std": 0.02,
         },
+        # v3r_eb_ffnn_aug_light = lighter augmentation (5% edge dropout, 0.01 noise, 60% mixup prob)
+        "v3r_eb_ffnn_aug_light": {
+            "model": "dense_gcn",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 60,
+            "loss": "l1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "use_residual": True,
+            "mixup_alpha": 0.2,
+            "mixup_prob": 0.6,
+            "use_edge_bias": True,
+            "edge_dropout": 0.05,
+            "gaussian_noise_std": 0.01,
+        },
+        # v3r_eb_ffnn_edgeweight = v3r_eb_ffnn + per-edge importance weighting (sqrt_mean)
+        "v3r_eb_ffnn_edgeweight": {
+            "model": "dense_gcn",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 60,
+            "loss": "l1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "use_residual": True,
+            "mixup_alpha": 0.2,
+            "use_edge_bias": True,
+            "edge_weight_mode": "sqrt_mean",
+        },
         # v3r_eb_ffnn_spec = v3r_eb_ffnn + spectral alignment loss (k=10; v3r got 0.1315 with spectral)
         "v3r_eb_ffnn_spec": {
             "model": "dense_gcn",
@@ -701,6 +751,27 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
             "use_edge_bias": True,
             "spectral_alignment_weight": 0.01,
             "spectral_alignment_k": 10,
+        },
+        # v3r_eb_ffnn_shrink = v3r_eb_ffnn + learned per-edge shrinkage (optimize α on val to minimize MAE)
+        "v3r_eb_ffnn_shrink": {
+            "model": "dense_gcn",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 60,
+            "loss": "l1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "use_residual": True,
+            "mixup_alpha": 0.2,
+            "use_edge_bias": True,
+            "learn_shrinkage": True,
         },
         # v3sn = v3r + per-subject scale normalisation + post-hoc calibration
         "v3sn": {
@@ -944,6 +1015,7 @@ def parse_args_defaults() -> dict:
         "edge_dropout": 0.0,
         "gaussian_noise_std": 0.0,
         "mixup_prob": 0.5,
+        "edge_weight_mode": "none",
     }
 
 
@@ -958,6 +1030,48 @@ def build_loss(cfg: TrainConfig) -> nn.Module:
         # Wrapped below with explicit closure in training loops.
         return nn.Identity()
     raise ValueError(f"Unsupported loss: {cfg.loss_name}")
+
+
+def compute_edge_weights(y_tr: np.ndarray, mode: str, eps: float = 1e-6) -> np.ndarray:
+    """Compute per-edge weights from training data. Shape (E,)."""
+    if mode == "none":
+        return None
+    y_mean = y_tr.mean(axis=0).astype(np.float32)
+    if mode == "mean":
+        return np.maximum(y_mean, eps)
+    if mode == "sqrt_mean":
+        return np.sqrt(y_mean + eps)
+    raise ValueError(f"Unknown edge_weight_mode: {mode}")
+
+
+def weighted_loss(
+    pred: torch.Tensor,
+    y: torch.Tensor,
+    w: torch.Tensor | None,
+    loss_name: str,
+    l1_weight: float = 0.7,
+) -> torch.Tensor:
+    """Compute loss with optional per-edge weighting. w: (E,) or None."""
+    if w is None:
+        if loss_name == "l1":
+            return nn.functional.l1_loss(pred, y)
+        if loss_name == "hybrid":
+            return l1_weight * nn.functional.l1_loss(pred, y) + (1 - l1_weight) * nn.functional.mse_loss(pred, y)
+        if loss_name == "smoothl1":
+            return nn.functional.smooth_l1_loss(pred, y)
+        return nn.functional.mse_loss(pred, y)
+    # Weighted: sum(w * |pred - y|) / (B * sum(w)) for L1
+    w = w.view(1, -1)  # (1, E)
+    L1 = torch.abs(pred - y)
+    L2 = (pred - y) ** 2
+    B = pred.size(0)
+    if loss_name == "l1":
+        return (w * L1).sum() / (B * w.sum())
+    if loss_name == "hybrid":
+        return l1_weight * (w * L1).sum() / (B * w.sum()) + (1 - l1_weight) * (w * L2).sum() / (B * w.sum())
+    if loss_name == "smoothl1":
+        return (w * nn.functional.smooth_l1_loss(pred, y, reduction="none")).sum() / (B * w.sum())
+    return (w * L2).sum() / (B * w.sum())
 
 
 # ---------------------------------------------------------------------------
@@ -1035,6 +1149,41 @@ def apply_calibration(
 def compute_bias_correction(pred: np.ndarray, true: np.ndarray) -> np.ndarray:
     """Compute per-edge bias: mean(pred - gt). Shape (E,)."""
     return (pred - true).mean(axis=0).astype(np.float32)
+
+
+def learn_per_edge_shrinkage(
+    val_preds: np.ndarray,
+    val_gt: np.ndarray,
+    y_mean: np.ndarray,
+    init_eps: float = 0.05,
+    max_iters: int = 500,
+    lr: float = 0.1,
+) -> np.ndarray:
+    """Learn per-edge shrinkage α to minimize val MAE.
+
+    pred_shrunk = (1 - α) * pred + α * y_mean. Optimize α ∈ [0,1] per edge.
+    Uses sigmoid(raw) for α; raw initialized so sigmoid(raw) ≈ init_eps.
+    """
+    n_edges = val_preds.shape[1]
+    # raw init: sigmoid(raw) = init_eps => raw = log(init_eps / (1 - init_eps))
+    init_raw = np.log(init_eps / (1.0 - init_eps + 1e-8))
+    raw = torch.nn.Parameter(torch.full((n_edges,), float(init_raw), dtype=torch.float32))
+    optimizer = torch.optim.Adam([raw], lr=lr)
+
+    pred_t = torch.from_numpy(val_preds.astype(np.float32))
+    gt_t = torch.from_numpy(val_gt.astype(np.float32))
+    mean_t = torch.from_numpy(y_mean.astype(np.float32))
+
+    for _ in range(max_iters):
+        optimizer.zero_grad()
+        alpha = torch.sigmoid(raw)
+        pred_shrunk = (1.0 - alpha) * pred_t + alpha * mean_t
+        loss = torch.nn.functional.l1_loss(pred_shrunk, gt_t)
+        loss.backward()
+        optimizer.step()
+
+    alpha_np = torch.sigmoid(raw.detach()).numpy().astype(np.float32)
+    return alpha_np
 
 
 
@@ -1179,6 +1328,12 @@ def train_with_validation(
         scheduler = None
     base_loss_fn = build_loss(cfg)
 
+    # Per-edge importance weighting (from training data)
+    edge_weight_t: torch.Tensor | None = None
+    if cfg.edge_weight_mode != "none":
+        w_np = compute_edge_weights(y_tr, cfg.edge_weight_mode)
+        edge_weight_t = torch.from_numpy(w_np).float().to(device)
+
     best_val = float("inf")
     best_state = None
     best_epoch = 0
@@ -1207,17 +1362,10 @@ def train_with_validation(
             if use_curriculum:
                 pred_m = pred[:, edge_mask_t]
                 y_m = y_vec[:, edge_mask_t]
-                if cfg.loss_name == "hybrid":
-                    loss = cfg.l1_weight * nn.functional.l1_loss(pred_m, y_m) + \
-                        (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred_m, y_m)
-                else:
-                    loss = base_loss_fn(pred_m, y_m)
+                w_m = edge_weight_t[edge_mask_t] if edge_weight_t is not None else None
+                loss = weighted_loss(pred_m, y_m, w_m, cfg.loss_name, cfg.l1_weight)
             else:
-                if cfg.loss_name == "hybrid":
-                    loss = cfg.l1_weight * nn.functional.l1_loss(pred, y_vec) + \
-                        (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
-                else:
-                    loss = base_loss_fn(pred, y_vec)
+                loss = weighted_loss(pred, y_vec, edge_weight_t, cfg.loss_name, cfg.l1_weight)
             if cfg.spectral_alignment_weight > 0:
                 l_spec = spectral_alignment_loss(
                     pred, y_vec, cfg.n_hr, cfg.spectral_alignment_k,
@@ -1244,11 +1392,7 @@ def train_with_validation(
                 else:
                     a = vec_to_adj(x_vec, cfg.n_lr, vectorizer)
                     pred = model(a, a)
-                if cfg.loss_name == "hybrid":
-                    val_loss = cfg.l1_weight * nn.functional.l1_loss(pred, y_vec) + \
-                        (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
-                else:
-                    val_loss = base_loss_fn(pred, y_vec)
+                val_loss = weighted_loss(pred, y_vec, edge_weight_t, cfg.loss_name, cfg.l1_weight)
                 if cfg.spectral_alignment_weight > 0:
                     l_spec = spectral_alignment_loss(
                         pred, y_vec, cfg.n_hr, cfg.spectral_alignment_k,
@@ -1345,6 +1489,12 @@ def train_full(
     else:
         grad_clip = lambda: None
 
+    # Per-edge importance weighting
+    edge_weight_t: torch.Tensor | None = None
+    if cfg.edge_weight_mode != "none":
+        w_np = compute_edge_weights(y_tr, cfg.edge_weight_mode)
+        edge_weight_t = torch.from_numpy(w_np).float().to(device)
+
     use_early_stop = x_va is not None and y_va is not None and patience is not None
     if use_early_stop:
         xva = torch.from_numpy(x_va).float().to(device)
@@ -1381,17 +1531,10 @@ def train_full(
                 pred = model(a, a)
             if use_curriculum:
                 pred_m, y_m = pred[:, edge_mask_t], y_vec[:, edge_mask_t]
-                if cfg.loss_name == "hybrid":
-                    loss = cfg.l1_weight * nn.functional.l1_loss(pred_m, y_m) + \
-                        (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred_m, y_m)
-                else:
-                    loss = base_loss_fn(pred_m, y_m)
+                w_m = edge_weight_t[edge_mask_t] if edge_weight_t is not None else None
+                loss = weighted_loss(pred_m, y_m, w_m, cfg.loss_name, cfg.l1_weight)
             else:
-                if cfg.loss_name == "hybrid":
-                    loss = cfg.l1_weight * nn.functional.l1_loss(pred, y_vec) + \
-                        (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
-                else:
-                    loss = base_loss_fn(pred, y_vec)
+                loss = weighted_loss(pred, y_vec, edge_weight_t, cfg.loss_name, cfg.l1_weight)
             if cfg.spectral_alignment_weight > 0:
                 l_spec = spectral_alignment_loss(
                     pred, y_vec, cfg.n_hr, cfg.spectral_alignment_k,
@@ -1422,10 +1565,7 @@ def train_full(
                     else:
                         a = vec_to_adj(x_vec, cfg.n_lr, vectorizer)
                         pred = model(a, a)
-                    if cfg.loss_name == "hybrid":
-                        v = cfg.l1_weight * nn.functional.l1_loss(pred, y_vec) + (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
-                    else:
-                        v = base_loss_fn(pred, y_vec)
+                    v = weighted_loss(pred, y_vec, edge_weight_t, cfg.loss_name, cfg.l1_weight)
                     if cfg.spectral_alignment_weight > 0:
                         l_spec = spectral_alignment_loss(
                             pred, y_vec, cfg.n_hr, cfg.spectral_alignment_k,
@@ -1544,6 +1684,7 @@ def run_cv(args: argparse.Namespace) -> None:
         edge_dropout=getattr(args, "edge_dropout", 0.0),
         gaussian_noise_std=getattr(args, "gaussian_noise_std", 0.0),
         mixup_prob=getattr(args, "mixup_prob", 0.5),
+        edge_weight_mode=getattr(args, "edge_weight_mode", "none"),
     )
 
     seed_everything(cfg.seed)
@@ -1562,6 +1703,8 @@ def run_cv(args: argparse.Namespace) -> None:
         print(f"  Spectral alignment: weight={cfg.spectral_alignment_weight}, k={cfg.spectral_alignment_k}")
     if cfg.edge_dropout > 0 or cfg.gaussian_noise_std > 0:
         print(f"  Augmentation: edge_dropout={cfg.edge_dropout}, gaussian_noise_std={cfg.gaussian_noise_std}, mixup_prob={cfg.mixup_prob}")
+    if cfg.edge_weight_mode != "none":
+        print(f"  Edge weight mode: {cfg.edge_weight_mode} (heavier edges weighted more in loss)")
 
     # --- Per-subject scale normalisation ---
     subj_scales_lr: np.ndarray | None = None
@@ -1817,6 +1960,7 @@ def run_full(args: argparse.Namespace) -> None:
         edge_dropout=getattr(args, "edge_dropout", 0.0),
         gaussian_noise_std=getattr(args, "gaussian_noise_std", 0.0),
         mixup_prob=getattr(args, "mixup_prob", 0.5),
+        edge_weight_mode=getattr(args, "edge_weight_mode", "none"),
     )
 
     device = get_device(args.device)
@@ -1831,6 +1975,8 @@ def run_full(args: argparse.Namespace) -> None:
     shrinkage_eps = getattr(args, "shrinkage_eps", 0.0)
     if shrinkage_eps > 0:
         print(f"Shrinkage: eps={shrinkage_eps} (pred = (1-eps)*pred + eps*train_mean)")
+    if getattr(args, "learn_shrinkage", False):
+        print("Learn shrinkage: will optimize per-edge α on val set to minimize MAE")
     print(f"Device: {device}")
     print(f"Train LR: {x_train.shape} | Train HR: {y_train.shape} | Test LR: {x_test.shape}")
     print(f"Config: {asdict(cfg)}")
@@ -1867,6 +2013,7 @@ def run_full(args: argparse.Namespace) -> None:
 
     preds_list = []
     total_train_seconds = 0.0
+    learned_alpha: np.ndarray | None = None  # per-edge shrinkage (35778,)
 
     for i, seed in enumerate(seeds):
         cfg.seed = seed
@@ -1889,6 +2036,8 @@ def run_full(args: argparse.Namespace) -> None:
             print(f"  Residual mode: subtracting per-edge HR mean (mean={y_mean_full.mean():.4f})")
         if (cfg.edge_dropout > 0 or cfg.gaussian_noise_std > 0) and i == 0:
             print(f"  Augmentation: edge_dropout={cfg.edge_dropout}, gaussian_noise_std={cfg.gaussian_noise_std}, mixup_prob={cfg.mixup_prob}")
+        if cfg.edge_weight_mode != "none" and i == 0:
+            print(f"  Edge weight mode: {cfg.edge_weight_mode}")
 
         fold_train_start = time.perf_counter()
         full_model = train_full(
@@ -1906,6 +2055,18 @@ def run_full(args: argparse.Namespace) -> None:
         preds = predict_vectors(full_model, x_test, device, vectorizer, cfg.batch_size, cfg.n_lr,
                                 y_mean=y_mean_full, lap_pe_dim=cfg.lap_pe_dim)
         preds = np.clip(preds, a_min=0.0, a_max=None)
+
+        # Learn per-edge shrinkage on val set (once, using first seed's val)
+        if getattr(args, "learn_shrinkage", False) and x_va is not None and y_va is not None and learned_alpha is None:
+            val_preds = predict_vectors(full_model, x_va, device, vectorizer, cfg.batch_size, cfg.n_lr,
+                                      y_mean=y_mean_full, lap_pe_dim=cfg.lap_pe_dim)
+            val_preds = np.clip(val_preds, a_min=0.0, a_max=None)
+            init_eps = shrinkage_eps if shrinkage_eps > 0 else 0.05
+            learned_alpha = learn_per_edge_shrinkage(val_preds, y_va, y_mean_pop, init_eps=init_eps)
+            mae_before = np.abs(val_preds - y_va).mean()
+            val_shrunk = (1 - learned_alpha) * val_preds + learned_alpha * y_mean_pop[np.newaxis, :]
+            mae_after = np.abs(val_shrunk - y_va).mean()
+            print(f"  Learned shrinkage | val MAE: {mae_before:.6f} -> {mae_after:.6f} | alpha mean={learned_alpha.mean():.4f}, std={learned_alpha.std():.4f}")
 
         # Post-hoc bias correction: subtract mean(pred-gt) on val from test preds (same space)
         if getattr(args, "bias_correct", False) and x_va is not None and y_va is not None:
@@ -1947,7 +2108,12 @@ def run_full(args: argparse.Namespace) -> None:
         preds_list.append(preds)
 
     preds = np.mean(preds_list, axis=0)
-    if shrinkage_eps > 0:
+    if learned_alpha is not None:
+        preds = (1 - learned_alpha) * preds + learned_alpha * y_mean_pop[np.newaxis, :]
+        alpha_path = out_dir / "learned_shrinkage.npy"
+        np.save(alpha_path, learned_alpha)
+        print(f"Applied learned per-edge shrinkage (alpha mean={learned_alpha.mean():.4f}) | saved {alpha_path}")
+    elif shrinkage_eps > 0:
         preds = (1 - shrinkage_eps) * preds + shrinkage_eps * y_mean_pop[np.newaxis, :]
     preds = np.clip(preds, a_min=0.0, a_max=1.0)
     assert preds.shape[1] == HR_FEATURES, f"Expected {HR_FEATURES} HR features, got {preds.shape[1]}"
@@ -2002,7 +2168,7 @@ def run_tune(args: argparse.Namespace) -> None:
         raise ImportError("Optuna is required for tune mode. Install with: pip install optuna")
 
     args = apply_preset(args)
-    tune_v3r = args.preset in ("v3r", "v3r_eb", "v3r_eb_ffnn", "v3r_eb_ffnn_aug", "v3r_eb_ffnn_spec") or (args.model == "dense_gcn" and args.preset in ("v3r", "v3r_eb", "v3r_eb_ffnn", "v3r_eb_ffnn_aug", "v3r_eb_ffnn_spec", "v3"))
+    tune_v3r = args.preset in ("v3r", "v3r_eb", "v3r_eb_ffnn", "v3r_eb_ffnn_aug", "v3r_eb_ffnn_aug_light", "v3r_eb_ffnn_spec", "v3r_eb_ffnn_edgeweight", "v3r_eb_ffnn_shrink") or (args.model == "dense_gcn" and args.preset in ("v3r", "v3r_eb", "v3r_eb_ffnn", "v3r_eb_ffnn_aug", "v3r_eb_ffnn_aug_light", "v3r_eb_ffnn_spec", "v3r_eb_ffnn_edgeweight", "v3r_eb_ffnn_shrink", "v3"))
     if not tune_v3r and args.model != "dense_gat":
         print("Tune mode: use --preset v3r for DenseGCN or --preset v4 for DenseGAT.")
         args.model = "dense_gat"
@@ -2266,12 +2432,21 @@ def run_tune(args: argparse.Namespace) -> None:
         np.savetxt(submission_path, submission, delimiter=",", header="ID,Predicted", comments="", fmt=["%d", "%.10f"])
         print(f"Full retrain done. Submission: {submission_path}")
     else:
-        print(f"Run full retrain with:")
-        print(f"  .venv/bin/python -m src.train_dense_gcn full --preset v4 --max-epochs 400 --val-ratio 0.15 --patience 50 \\")
-        print(f"    --edge-scale {best_params['edge_scale']} --hr-refine-layers {best_params['hr_refine_layers']} \\")
-        print(f"    --dropout {best_params['dropout']} --lr {best_params['lr']} \\")
-        print(f"    --hidden-dim {best_params['hidden_dim']} --num-layers {best_params['num_layers']} \\")
-        print(f"    --submission-path submission/dense_gat_v4_submission.csv")
+        if tune_v3r:
+            preset = args.preset
+            print(f"Run full retrain with:")
+            print(f"  .venv/bin/python -m src.train_dense_gcn full --preset {preset} --max-epochs 600 --val-ratio 0.15 --patience 60 \\")
+            print(f"    --lr {best_params['lr']} --dropout {best_params['dropout']} \\")
+            print(f"    --hidden-dim {best_params['hidden_dim']} --num-layers {best_params['num_layers']} \\")
+            print(f"    --mixup-alpha {best_params['mixup_alpha']} \\")
+            print(f"    --submission-path submission/{preset}_tuned_submission.csv")
+        else:
+            print(f"Run full retrain with:")
+            print(f"  .venv/bin/python -m src.train_dense_gcn full --preset v4 --max-epochs 400 --val-ratio 0.15 --patience 50 \\")
+            print(f"    --edge-scale {best_params['edge_scale']} --hr-refine-layers {best_params['hr_refine_layers']} \\")
+            print(f"    --dropout {best_params['dropout']} --lr {best_params['lr']} \\")
+            print(f"    --hidden-dim {best_params['hidden_dim']} --num-layers {best_params['num_layers']} \\")
+            print(f"    --submission-path submission/dense_gat_v4_submission.csv")
         print(f"Or re-run tune with --full-retrain to do it automatically.")
 
 

@@ -24,26 +24,36 @@ import torch.nn as nn
 class DenseGCNBlock(nn.Module):
     """Single dense GCN layer with LayerNorm, residual connection, and dropout."""
 
-    def __init__(self, dim: int, dropout: float = 0.3):
+    def __init__(self, dim: int, dropout: float = 0.3, ffn_mult: int = 4):
         super().__init__()
         self.linear = nn.Linear(dim, dim)
-        self.norm = nn.LayerNorm(dim)
-        self.drop = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(dim)
+        self.drop1 = nn.Dropout(dropout)
+
+        # FFN sublayer (Transformer-style)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * ffn_mult),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * ffn_mult, dim),
+        )
+        self.norm2 = nn.LayerNorm(dim)
+        self.drop2 = nn.Dropout(dropout)
 
     def forward(self, S: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            S: (B, N, N) normalised adjacency
-            H: (B, N, dim) node representations
-        Returns:
-            H': (B, N, dim) updated node representations
-        """
-        out = S @ H                   # neighbourhood aggregation
-        out = self.linear(out)        # learnable transform
-        out = self.norm(out)          # stabilise
+        # --- Message passing sublayer ---
+        out = S @ H
+        out = self.linear(out)
+        out = self.norm1(out)
         out = torch.relu(out)
-        out = self.drop(out)
-        return out + H                # residual
+        out = self.drop1(out)
+        H = H + out
+
+        # --- FFN sublayer ---
+        out = self.ffn(self.norm2(H))
+        out = self.drop2(out)
+        H = H + out
+        return H
 
 
 class DenseGCNGenerator(nn.Module):
@@ -62,6 +72,7 @@ class DenseGCNGenerator(nn.Module):
         raw_output: bool = False,
         lap_pe_dim: int = 0,
         pearl_pe_dim: int = 0,
+        ffn_mult: int = 4
     ):
         super().__init__()
         self.n_lr = n_lr
@@ -85,7 +96,7 @@ class DenseGCNGenerator(nn.Module):
         )
 
         self.gcn_layers = nn.ModuleList([
-            DenseGCNBlock(hidden_dim, dropout=dropout)
+            DenseGCNBlock(hidden_dim, dropout=dropout, ffn_mult=ffn_mult)
             for _ in range(num_layers)
         ])
 

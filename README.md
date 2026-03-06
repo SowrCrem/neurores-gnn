@@ -17,14 +17,35 @@ However, the problem is challenging for several reasons. First, the mapping from
 
 ## NeuroRes-GNN: Methodology
 
-**NeuroRes-GNN** uses the **v3r_eb_ffnn** configuration as the best-performing model to date. Key building blocks:
+**NeuroRes-GNN** uses the **v3r_eb_ffnn_aug_light** configuration as the best-performing model to date (v3r_eb_ffnn + lighter augmentation: 5% edge dropout, 0.01 Gaussian noise, 60% mixup prob).
 
-1. **Dense GCN encoder**: Multi-layer graph convolution with residual connections, LayerNorm and an optional FFN (feed-forward network) sublayer in each block.
-2. **Learnable per-edge bias**: Decoder includes a learnable bias term per HR edge, improving MAE over the baseline.
-3. **Residual learning + Mixup**: Per-edge HR mean subtraction during training; Graph Mixup (α=0.2) for regularization.
-4. **Bilinear edge decoder**: Predicted HR adjacency via H W H^T with edge bias, symmetrised and clamped to [0, ∞).
+**Latest submission:** Kaggle MAE **0.127182** (Big Dawgs, rank 7).
 
-The model is trained **inductively** with 3-fold cross-validation. Evaluation uses 8 measures: MAE, PCC, JSD and average MAE of PageRank, Eigenvector, Betweenness centralities, plus node strength and clustering coefficient.
+### Architecture (v3r_eb_ffnn_aug_light)
+
+The model maps a low-resolution (LR) brain graph (160 nodes) to a high-resolution (HR) graph (268 nodes). All operations are dense tensor matmuls - no sparse graph library required.
+
+| Stage | Description |
+|-------|-------------|
+| **1. Node features** | Each LR node is represented by its adjacency row: `X_lr ∈ ℝ^{160×160}`. The full LR adjacency is used as input. |
+| **2. Normalisation** | Symmetric normalisation: `S = D^{-1/2}(A + I)D^{-1/2}` so message passing is scale-invariant. |
+| **3. Input projection** | `Linear(160 → 192)` + LayerNorm + ReLU + Dropout. |
+| **4. Dense GCN blocks (×3)** | Each block has two sublayers with residual connections: (a) **Message passing**: `H' = S @ H`, linear transform, LayerNorm, ReLU, dropout, then `H = H + H'`; (b) **FFN sublayer**: `FFN(H) = Linear(192→768) → ReLU → Dropout → Linear(768→192)`, then `H = H + FFN(LayerNorm(H))`. |
+| **5. Node upsample** | `Linear(160 → 268)` maps LR node embeddings to HR node space. |
+| **6. Bilinear edge decoder** | `A_hr = H @ W_edge @ H^T`, symmetrised. Extract upper triangle → 35,778 HR edge weights. |
+| **7. Per-edge bias** | Learnable bias `b_e` per HR edge: `pred_e = bilinear_e + b_e`. Captures systematic per-edge offsets (e.g. hub vs sparse edges) that the bilinear form cannot express. |
+
+### Training
+
+| Component | Details |
+|-----------|---------|
+| **Residual learning** | Targets are centred: `y_target = y_hr - y_mean` (per-edge mean over training set). The model predicts deviations; at inference, `pred_final = pred + y_mean`. |
+| **Loss** | L1 (MAE-aligned). |
+| **Regularisation** | Graph Mixup (α=0.2, prob=0.6) on LR adjacency and HR targets; 5% edge dropout, Gaussian noise std=0.01; dropout 0.35. |
+| **Optimiser** | AdamW, lr=8e-4, patience=60. |
+| **Evaluation** | 3-fold cross-validation, inductively. Eight measures: MAE, PCC, JSD, and average MAE of PageRank, Eigenvector, Betweenness centralities, node strength, and clustering coefficient. |
+
+Final predictions are clamped to `[0, ∞)` before submission.
 
 *(Figure to be added later.)*
 
@@ -35,18 +56,12 @@ What is kept in this repo and why:
 | Path | Purpose |
 |------|---------|
 | `notebooks/main.ipynb` | **Spec deliverable** - 3-fold CV, bar plots, `predictions_fold_{1,2,3}.csv`, `submission.csv`. Run this for the full pipeline. |
-| `src/train_dense_gcn.py` | Main training script - 3-fold CV, full retrain, presets (v3r_eb_ffnn, etc.). Invoked by `main.ipynb` for the best config. |
+| `src/train_dense_gcn.py` | Main training script - 3-fold CV, full retrain, presets (v3r_eb_ffnn_aug_light, etc.). Invoked by `main.ipynb` for the best config. |
 | `models/` | Model definitions - DenseGCN, SGC baseline, VGAE baseline, Bi-SR, GIN, GAT, etc. |
 | `utils/` | Shared utilities - `matrix_vectorizer`, `metrics` (8 measures), `plotting` (bar charts). |
 | `gcn-encoder-ca-decoder/` | Data helpers - `data_utils.py` (`vec_to_adj`, `lr_node_features`, `to_tensor`) used by `main.ipynb`. |
 | `reproducibility.py` | Reproducibility config (Spec Note 2) - seed, CUDA/cudnn settings. |
 | `requirements.txt` | Dependencies for reproducible runs. |
-
-**Not in repo** (gitignored; retain locally if needed):
-
-- `docs/` - Internal planning, research notes, Kaggle analysis. Not required for submission.
-- `scripts/` - Auxiliary tools (postprocess, graph statistics). Not part of the core pipeline.
-- `data/`, `submission/`, `artifacts/`, `checkpoints/` - Data and outputs; download data via Kaggle CLI.
 
 ## Used External Libraries
 
@@ -58,7 +73,16 @@ Libraries: **torch**, **dgl**, **numpy**, **scipy**, **pandas**, **scikit-learn*
 
 ## Results
 
-<!-- TODO: Insert bar plots. Run `notebooks/main.ipynb` to generate bar plots and compare NeuroRes-GNN (v3r_eb_ffnn) with SGC and VGAE baselines. -->
+<!-- TODO: Insert bar plots. Run `notebooks/main.ipynb` to generate bar plots and compare NeuroRes-GNN (v3r_eb_ffnn_aug_light) with SGC and VGAE baselines. -->
+
+**Reproduce best submission (v3r_eb_ffnn_aug_light):**
+
+```bash
+# Full pipeline (spec deliverable): run notebooks/main.ipynb for 3-fold CV, bar plots, submission.csv
+
+# Or run training directly for a Kaggle submission
+.venv/bin/python -m src.train_dense_gcn full --preset v3r_eb_ffnn_aug_light --max-epochs 600 --submission-path submission/v3r_eb_ffnn_aug_light_submission.csv
+```
 
 ## References
 

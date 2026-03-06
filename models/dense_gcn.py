@@ -102,8 +102,12 @@ class DenseGCNGenerator(nn.Module):
 
         self.upsample = nn.Linear(n_lr, n_hr)
 
-        self.edge_W = nn.Parameter(torch.empty(hidden_dim, hidden_dim))
-        nn.init.xavier_uniform_(self.edge_W, gain=0.5)
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1)
+        )
 
         self._triu_idx = None
 
@@ -152,14 +156,21 @@ class DenseGCNGenerator(nn.Module):
         # Node upsample: (B, n_lr, d) -> (B, n_hr, d)
         H = self.upsample(H.transpose(1, 2)).transpose(1, 2)
 
-        # Bilinear edge decode + symmetrise
-        HW = H @ self.edge_W                            # (B, n_hr, d)
-        A = HW @ H.transpose(1, 2)                      # (B, n_hr, n_hr)
-        A = 0.5 * (A + A.transpose(1, 2))
+        # Symmetric pairwise edge decode
+        idx = self._get_triu_indices(H.device)
 
-        idx = self._get_triu_indices(A.device)
-        pred = A[:, idx[0], idx[1]]                      # (B, 35778)
+        h_i = H[:, idx[0], :]   # (B, E, d)
+        h_j = H[:, idx[1], :]   # (B, E, d)
+
+        pair_feat = torch.cat([
+            h_i + h_j,
+            h_i * h_j,
+            torch.abs(h_i - h_j)
+        ], dim=-1)              # (B, E, 3d)
+
+        pred = self.edge_mlp(pair_feat).squeeze(-1)    # (B, E)
+
         if self.raw_output:
             pred = pred + self.edge_bias.unsqueeze(0)
-            return pred  # residual mode: caller adds y_mean back; can be negative
-        return torch.nn.functional.softplus(pred)  # non-negative + gradient flow
+            return pred
+        return torch.nn.functional.softplus(pred)

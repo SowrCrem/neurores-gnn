@@ -5,7 +5,7 @@ Redesigned for stability with 167 samples (DESIGN_CONSTRAINTS.md):
 
   - GCN-first: 2 GCN blocks provide stable structure-aware encoding (like DenseGCN).
   - 1 GAT block with strong edge_scale (0.5): graph dominates, attention refines.
-  - Single linear upsample (like DenseGCN) — no complex MLP.
+  - Single linear upsample (like DenseGCN) - no complex MLP.
   - No hr_refine: pure attention on HR with no graph structure overfits (past failure).
   - Conservative decoder init (gain=0.1), softplus, output clamp [0,1] per spec.
   - GELU throughout (avoids ReLU collapse before decoder).

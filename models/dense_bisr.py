@@ -78,8 +78,8 @@ class DenseBiSRGenerator(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # Fixed small random init for HR nodes to break symmetry (0.1 scale avoids collapse)
-        hr_init = 0.1 * torch.rand(n_hr, hidden_dim)
+        # Fixed random init U(0,1) for HR nodes to break symmetry (paper: Singh & Rekik 2025)
+        hr_init = torch.rand(n_hr, hidden_dim)
         self.register_buffer("hr_init", hr_init)
 
         self.bipartite_layers = nn.ModuleList([

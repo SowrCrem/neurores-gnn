@@ -6,6 +6,15 @@ artifacts/
 *.zip
 submission.csv
 
+# Internal docs (planning, research, analysis) - retain locally, not for public repo
+docs/
+
+# Auxiliary scripts (postprocess, analysis) - not required for spec submission
+scripts/
+
+# Legacy configs (used by src/train.py only; train_dense_gcn uses presets)
+configs/
+
 # Python
 __pycache__/
 *.py[cod]

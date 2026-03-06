@@ -127,7 +127,7 @@ def plot_folds(fold_results: list[dict], split_if_obscured: bool = True, verbose
         graph_metrics = [k for k in METRIC_ORDER if k not in matrix_metrics]
 
         if verbose:
-            print("Scale disparity detected — splitting into two figures:")
+            print("Scale disparity detected - splitting into two figures:")
             print(f"  Matrix-level metrics: {matrix_metrics}")
             print(f"  Graph-level metrics : {graph_metrics}")
 

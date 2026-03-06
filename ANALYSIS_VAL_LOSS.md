@@ -4,9 +4,9 @@
 
 From the terminal output:
 - **Val loss identical** from epoch 1 to 50: `0.055850`, `0.060625`, `0.057941` (exact, not rounding)
-- **Best val always at epoch 1** — model never improves on validation after first epoch
+- **Best val always at epoch 1** - model never improves on validation after first epoch
 - **Train loss decreases**: 0.11 → ~0.06, so the model *is* learning on training data
-- **PCC = NaN** — Pearson correlation undefined, indicating **zero or near-zero variance** in predictions (constant outputs)
+- **PCC = NaN** - Pearson correlation undefined, indicating **zero or near-zero variance** in predictions (constant outputs)
 
 ## Root Causes
 
@@ -48,7 +48,7 @@ DenseGCN uses ReLU in GCN blocks, so H is non-negative, but the path is more con
 
 ## Fixes Applied
 
-1. **DenseGAT (critical)**: Replace `clamp(pred, 0)` with `softplus(pred)` — clamp cuts gradients when pre-clamp values are negative; model collapsed to all-zero outputs after 1 epoch. Softplus ensures non-negative output with full gradient flow.
+1. **DenseGAT (critical)**: Replace `clamp(pred, 0)` with `softplus(pred)` - clamp cuts gradients when pre-clamp values are negative; model collapsed to all-zero outputs after 1 epoch. Softplus ensures non-negative output with full gradient flow.
 2. **DenseGAT**: Parameterize decoder as `H @ P @ P^T @ H^T` (P instead of W) for better conditioning.
 3. **DenseGAT**: GELU before decoder (smooth activation).
 4. **Training**: Lower v4 LR from 5e-3 → 8e-4, add ReduceLROnPlateau scheduler.

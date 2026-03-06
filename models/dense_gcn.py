@@ -5,7 +5,7 @@ Unlike the SGC baseline (single linear transform on 2-dim features), this model
 uses full adjacency-row node features (160-dim) and applies multiple nonlinear
 GCN layers with residual connections and layer normalization.
 
-All operations are dense tensor matmuls — no DGL dependency.
+All operations are dense tensor matmuls - no DGL dependency.
 
 Architecture:
     1. Node features = LR adjacency rows (B, 160, 160)
@@ -22,23 +22,26 @@ import torch.nn as nn
 
 
 class DenseGCNBlock(nn.Module):
-    """Single dense GCN layer with LayerNorm, residual connection, and dropout."""
+    """Single dense GCN layer with LayerNorm, residual connection, and dropout.
+
+    When ffn_mult <= 0, skips the FFN sublayer (legacy v3r behaviour).
+    """
 
     def __init__(self, dim: int, dropout: float = 0.3, ffn_mult: int = 4):
         super().__init__()
         self.linear = nn.Linear(dim, dim)
         self.norm1 = nn.LayerNorm(dim)
         self.drop1 = nn.Dropout(dropout)
-
-        # FFN sublayer (Transformer-style)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * ffn_mult),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim * ffn_mult, dim),
-        )
-        self.norm2 = nn.LayerNorm(dim)
-        self.drop2 = nn.Dropout(dropout)
+        self.use_ffn = ffn_mult > 0
+        if self.use_ffn:
+            self.ffn = nn.Sequential(
+                nn.Linear(dim, dim * ffn_mult),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(dim * ffn_mult, dim),
+            )
+            self.norm2 = nn.LayerNorm(dim)
+            self.drop2 = nn.Dropout(dropout)
 
     def forward(self, S: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
         # --- Message passing sublayer ---
@@ -49,10 +52,11 @@ class DenseGCNBlock(nn.Module):
         out = self.drop1(out)
         H = H + out
 
-        # --- FFN sublayer ---
-        out = self.ffn(self.norm2(H))
-        out = self.drop2(out)
-        H = H + out
+        # --- FFN sublayer (optional; skip when ffn_mult=0 for legacy v3r) ---
+        if self.use_ffn:
+            out = self.ffn(self.norm2(H))
+            out = self.drop2(out)
+            H = H + out
         return H
 
 
@@ -72,7 +76,8 @@ class DenseGCNGenerator(nn.Module):
         raw_output: bool = False,
         lap_pe_dim: int = 0,
         pearl_pe_dim: int = 0,
-        ffn_mult: int = 4
+        ffn_mult: int = 4,
+        use_edge_bias: bool = True,
     ):
         super().__init__()
         self.n_lr = n_lr
@@ -80,7 +85,9 @@ class DenseGCNGenerator(nn.Module):
         self.raw_output = raw_output
         self.lap_pe_dim = lap_pe_dim
         self.pearl_pe_dim = pearl_pe_dim
-        self.edge_bias = nn.Parameter(torch.zeros(self.n_hr * (self.n_hr - 1) // 2))
+        self.use_edge_bias = use_edge_bias
+        if use_edge_bias:
+            self.edge_bias = nn.Parameter(torch.zeros(self.n_hr * (self.n_hr - 1) // 2))
 
         input_dim = n_lr + lap_pe_dim + pearl_pe_dim  # adjacency rows + optional Laplacian PE + PEARL PE
         
@@ -160,6 +167,7 @@ class DenseGCNGenerator(nn.Module):
         idx = self._get_triu_indices(A.device)
         pred = A[:, idx[0], idx[1]]                      # (B, 35778)
         if self.raw_output:
-            pred = pred + self.edge_bias.unsqueeze(0)
+            if self.use_edge_bias:
+                pred = pred + self.edge_bias.unsqueeze(0)
             return pred  # residual mode: caller adds y_mean back; can be negative
         return torch.nn.functional.softplus(pred)  # non-negative + gradient flow

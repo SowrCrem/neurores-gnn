@@ -11,7 +11,7 @@ Usage:
     .venv/bin/python -m src.train_dense_gcn tune --preset v4 --out-dir artifacts/dense_gat_v4_tune
     .venv/bin/python -m src.train_dense_gcn full --preset v4 --max-epochs 50 --submission-path submission/dense_gat_v4_submission.csv
 
-See docs/HYPERPARAMETER_TUNING.md for full tuning commands and workflow.
+For hyperparameter tuning, use the tune subcommand with --preset.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.model_selection import KFold, train_test_split
@@ -102,6 +103,13 @@ class TrainConfig:
     lr_min: float = 1e-6         # minimum LR for cosine / plateau schedules
     curriculum_phase_epochs: int = 0   # Phase 1: train on heavy edges only; 0=disabled
     curriculum_heavy_percentile: float = 50.0  # Percentile for "heavy" edges (top X% by mean weight)
+    spectral_alignment_weight: float = 0.0   # Auxiliary loss: L_total = L_base + weight * L_spec; 0=disabled
+    spectral_alignment_k: int = 5      # Top-k eigenvalues for spectral loss (5–20)
+    use_edge_bias: bool = True         # Learnable per-edge bias in decoder (v3r_eb, v3r_eb_ffnn); False = legacy v3r
+    # Stronger data augmentation (0=disabled)
+    edge_dropout: float = 0.0         # LR edge dropout prob (0.05–0.15); forces robustness to missing edges
+    gaussian_noise_std: float = 0.0   # Add N(0, std) to LR adjacency (0.01–0.05); clamp to [0,1]
+    mixup_prob: float = 0.5           # Probability of applying mixup when alpha > 0 (default 0.5)
 
 
 def parse_args() -> argparse.Namespace:
@@ -113,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     def add_shared(p: argparse.ArgumentParser) -> None:
         p.add_argument("--data-dir", type=str, default=DEFAULT_DATA_DIR)
         p.add_argument("--out-dir", type=str, default=DEFAULT_OUT_DIR)
-        p.add_argument("--preset", type=str, default="v2", choices=["v2", "v3", "v3r", "v3sn", "v3r_pe", "v3r_lrs", "v3r_cos", "v4", "v5", "bisr", "bisr_v2", "bisr_v3r", "gcn_ca", "gin", "gin_n", "gin_v3r", "gps", "gps_v3r", "graphsage", "sage_v3r", "stp", "stp_pe"])
+        p.add_argument("--preset", type=str, default="v2", choices=["v2", "v3", "v3r", "v3r_eb", "v3r_eb_ffnn", "v3r_eb_ffnn_aug", "v3r_eb_ffnn_spec", "v3sn", "v3r_pe", "v3r_lrs", "v3r_cos", "v4", "v5", "bisr", "bisr_v2", "bisr_v3r", "gcn_ca", "gin", "gin_n", "gin_v3r", "gps", "gps_v3r", "graphsage", "sage_v3r", "stp", "stp_pe"])
         p.add_argument("--model", type=str, default="dense_gcn", choices=["dense_gcn", "dense_gat", "dense_bisr", "dense_gcn_ca", "dense_gin", "dense_gcn_gps", "dense_gcn_lrs", "dense_graphsage", "dense_stp"])
         p.add_argument("--seed", type=int, default=42)
         p.add_argument("--epochs", type=int, default=400)
@@ -154,6 +162,20 @@ def parse_args() -> argparse.Namespace:
                        help="Curriculum: phase 1 trains on heavy edges only for this many epochs; 0=disabled")
         p.add_argument("--curriculum-heavy-percentile", type=float, default=50.0,
                        help="Curriculum: percentile for heavy edges (top X%% by mean weight; default 50)")
+        p.add_argument("--spectral-alignment-weight", type=float, default=0.0,
+                       help="Spectral alignment auxiliary loss weight; 0=disabled, 0.01=recommended")
+        p.add_argument("--spectral-alignment-k", type=int, default=5,
+                       help="Number of top eigenvalues for spectral loss (default 5)")
+        p.add_argument("--use-edge-bias", action="store_true", default=False,
+                       help="Learnable per-edge bias in decoder (v3r_eb, v3r_eb_ffnn)")
+        p.add_argument("--no-edge-bias", action="store_true", default=False,
+                       help="Disable per-edge bias (legacy v3r)")
+        p.add_argument("--edge-dropout", type=float, default=0.0,
+                       help="LR edge dropout prob (0=disabled, 0.05-0.15); forces robustness to missing edges")
+        p.add_argument("--gaussian-noise-std", type=float, default=0.0,
+                       help="Add N(0,std) to LR adjacency (0=disabled, 0.01-0.05); clamp to [0,1]")
+        p.add_argument("--mixup-prob", type=float, default=0.5,
+                       help="Probability of applying mixup when alpha>0 (default 0.5)")
 
     cv = sub.add_parser("cv", help="Run 3-fold CV and log metrics/resources.")
     add_shared(cv)
@@ -253,6 +275,42 @@ def vec_to_adj(vec: torch.Tensor, n: int, vectorizer: MatrixVectorizer) -> torch
     return torch.from_numpy(np.stack(mats)).to(device=vec.device, dtype=vec.dtype)
 
 
+def spectral_alignment_loss(
+    pred_vec: torch.Tensor,
+    gt_vec: torch.Tensor,
+    n: int,
+    k: int,
+    vectorizer: MatrixVectorizer,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    L_spec = || λ(L_pred) - λ(L_gt) ||₂² for top-k eigenvalues of normalized Laplacian.
+
+    L = I - D^{-1/2} A D^{-1/2}. Takes top-k largest eigenvalues (last k from eigvalsh).
+    """
+    pred_mats = vec_to_adj(pred_vec, n, vectorizer)  # (B, n, n)
+    gt_mats = vec_to_adj(gt_vec, n, vectorizer)  # (B, n, n)
+    pred_mats = pred_mats.clamp(min=0.0)
+    gt_mats = gt_mats.clamp(min=0.0)
+
+    eps = 1e-6
+    D_pred = pred_mats.sum(dim=-1) + eps  # (B, n)
+    D_gt = gt_mats.sum(dim=-1) + eps  # (B, n)
+    D_pred_inv_sqrt = D_pred ** (-0.5)
+    D_gt_inv_sqrt = D_gt ** (-0.5)
+    # L = I - D^{-1/2} A D^{-1/2}
+    L_pred = pred_mats * D_pred_inv_sqrt.unsqueeze(-1) * D_pred_inv_sqrt.unsqueeze(-2)
+    L_pred = torch.eye(n, device=device, dtype=pred_mats.dtype).unsqueeze(0) - L_pred
+    L_gt = gt_mats * D_gt_inv_sqrt.unsqueeze(-1) * D_gt_inv_sqrt.unsqueeze(-2)
+    L_gt = torch.eye(n, device=device, dtype=gt_mats.dtype).unsqueeze(0) - L_gt
+
+    eig_pred = torch.linalg.eigvalsh(L_pred)  # (B, n), ascending
+    eig_gt = torch.linalg.eigvalsh(L_gt)  # (B, n), ascending
+    eig_pred_k = eig_pred[:, -k:]
+    eig_gt_k = eig_gt[:, -k:]
+    return ((eig_pred_k - eig_gt_k) ** 2).mean()
+
+
 def build_model(cfg: TrainConfig, device: torch.device) -> nn.Module:
     if cfg.model_name == "dense_gat":
         return DenseGATGenerator(
@@ -343,6 +401,8 @@ def build_model(cfg: TrainConfig, device: torch.device) -> nn.Module:
         raw_output=cfg.use_residual,
         lap_pe_dim=cfg.lap_pe_dim,
         pearl_pe_dim=cfg.pearl_pe_dim,
+        ffn_mult=cfg.ffn_mult,
+        use_edge_bias=cfg.use_edge_bias,
     ).to(device)
 
 
@@ -352,7 +412,7 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
 
     v2: existing dense_gcn_v2 baseline.
     v3: balanced capacity + MAE-aligned objective.
-    v4: DenseGATNet — graph-attention encoder + multi-head bilinear decoder.
+    v4: DenseGATNet - graph-attention encoder + multi-head bilinear decoder.
     """
     preset_map = {
         "v2": {
@@ -380,7 +440,7 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
             "patience": 45,
             "loss": "smoothl1",
             "l1_weight": 0.7,
-            "huber_beta": 0.05,   # was 1.0 — now L1 region kicks in at |err|>0.05 (appropriate for [0,1] edges)
+            "huber_beta": 0.05,   # was 1.0 - now L1 region kicks in at |err|>0.05 (appropriate for [0,1] edges)
             "num_heads": 4,
             "ffn_mult": 4,
             "num_decoder_heads": 4,
@@ -469,7 +529,7 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
             "hr_refine_layers": 1,
             "edge_scale": 0.2,
         },
-        # bisr_v3r = Bi-SR + v3r training (L1, residual, mixup) — transfers from GIN v3r success
+        # bisr_v3r = Bi-SR + v3r training (L1, residual, mixup) - transfers from GIN v3r success
         "bisr_v3r": {
             "model": "dense_bisr",
             "hidden_dim": 192,
@@ -537,7 +597,48 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
             "hr_refine_layers": 1,
             "edge_scale": 0.2,
         },
+        # v3r = legacy baseline (no edge bias, no FFN) - reproduces v3r_shrinkage_008 (0.132)
         "v3r": {
+            "model": "dense_gcn",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 60,
+            "loss": "l1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 0,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "use_residual": True,
+            "mixup_alpha": 0.2,
+            "use_edge_bias": False,
+        },
+        # v3r_eb = v3r + learnable per-edge bias - Dhruv "v3 + per edge bias" (0.127)
+        "v3r_eb": {
+            "model": "dense_gcn",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 60,
+            "loss": "l1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 0,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "use_residual": True,
+            "mixup_alpha": 0.2,
+            "use_edge_bias": True,
+        },
+        # v3r_eb_ffnn = v3r + edge bias + FFN in GCN blocks - Dhruv "v3 + edge bias + ffnn" (0.127)
+        "v3r_eb_ffnn": {
             "model": "dense_gcn",
             "hidden_dim": 192,
             "num_layers": 3,
@@ -554,6 +655,52 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
             "edge_scale": 0.2,
             "use_residual": True,
             "mixup_alpha": 0.2,
+            "use_edge_bias": True,
+        },
+        # v3r_eb_ffnn_aug = v3r_eb_ffnn + stronger augmentation (edge dropout, Gaussian noise, higher mixup prob)
+        "v3r_eb_ffnn_aug": {
+            "model": "dense_gcn",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 60,
+            "loss": "l1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "use_residual": True,
+            "mixup_alpha": 0.3,
+            "mixup_prob": 0.8,
+            "use_edge_bias": True,
+            "edge_dropout": 0.08,
+            "gaussian_noise_std": 0.02,
+        },
+        # v3r_eb_ffnn_spec = v3r_eb_ffnn + spectral alignment loss (k=10; v3r got 0.1315 with spectral)
+        "v3r_eb_ffnn_spec": {
+            "model": "dense_gcn",
+            "hidden_dim": 192,
+            "num_layers": 3,
+            "dropout": 0.35,
+            "lr": 8e-4,
+            "patience": 60,
+            "loss": "l1",
+            "l1_weight": 0.7,
+            "huber_beta": 1.0,
+            "num_heads": 4,
+            "ffn_mult": 4,
+            "num_decoder_heads": 4,
+            "hr_refine_layers": 1,
+            "edge_scale": 0.2,
+            "use_residual": True,
+            "mixup_alpha": 0.2,
+            "use_edge_bias": True,
+            "spectral_alignment_weight": 0.01,
+            "spectral_alignment_k": 10,
         },
         # v3sn = v3r + per-subject scale normalisation + post-hoc calibration
         "v3sn": {
@@ -567,12 +714,13 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
             "l1_weight": 0.7,
             "huber_beta": 1.0,
             "num_heads": 4,
-            "ffn_mult": 4,
+            "ffn_mult": 0,
             "num_decoder_heads": 4,
             "hr_refine_layers": 1,
             "edge_scale": 0.2,
             "use_residual": True,
             "mixup_alpha": 0.2,
+            "use_edge_bias": False,
             "subject_scale": True,
             "calibrate": True,
         },
@@ -607,12 +755,13 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
             "l1_weight": 0.7,
             "huber_beta": 1.0,
             "num_heads": 4,
-            "ffn_mult": 4,
+            "ffn_mult": 0,
             "num_decoder_heads": 4,
             "hr_refine_layers": 1,
             "edge_scale": 0.2,
             "use_residual": True,
             "mixup_alpha": 0.2,
+            "use_edge_bias": False,
             "lap_pe_dim": 4,
         },
         # gin_v3r = GIN (normalised adjacency) + v3r training improvements
@@ -703,12 +852,13 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
             "l1_weight": 0.7,
             "huber_beta": 1.0,
             "num_heads": 4,
-            "ffn_mult": 4,
+            "ffn_mult": 0,
             "num_decoder_heads": 4,
             "hr_refine_layers": 1,
             "edge_scale": 0.2,
             "use_residual": True,
             "mixup_alpha": 0.2,
+            "use_edge_bias": False,
             "lr_min": 1e-5,
         },
         "stp": {
@@ -752,8 +902,11 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
     chosen = preset_map[args.preset]
     defaults = parse_args_defaults()
     for k, v in chosen.items():
-        if getattr(args, k) == defaults[k]:
+        if getattr(args, k, None) == defaults.get(k):
             setattr(args, k, v)
+    # --no-edge-bias overrides preset
+    if getattr(args, "no_edge_bias", False):
+        args.use_edge_bias = False
     return args
 
 
@@ -785,6 +938,12 @@ def parse_args_defaults() -> dict:
         "pearl_pe_dim": 0,
         "lr_schedule": "plateau",
         "lr_min": 1e-6,
+        "use_edge_bias": False,
+        "spectral_alignment_weight": 0.0,
+        "spectral_alignment_k": 5,
+        "edge_dropout": 0.0,
+        "gaussian_noise_std": 0.0,
+        "mixup_prob": 0.5,
     }
 
 
@@ -930,21 +1089,42 @@ def compute_lap_pe(
 
 
 def mixup_batch(
-    x_vec: torch.Tensor, y_vec: torch.Tensor, alpha: float
+    x_vec: torch.Tensor, y_vec: torch.Tensor, alpha: float, prob: float = 0.5
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Graph Mixup: λ ~ Beta(alpha, alpha), applied with 50% probability.
+    """Graph Mixup: λ ~ Beta(alpha, alpha), applied with given probability.
 
     Convex combinations of symmetric connectivity matrices are valid brain
     graphs (symmetric, non-negative, [0,1]-bounded under clamp), so mixup
     in adjacency space is domain-valid.
     """
-    if alpha <= 0.0 or np.random.random() > 0.5:
+    if alpha <= 0.0 or np.random.random() > prob:
         return x_vec, y_vec
     lam = float(np.random.beta(alpha, alpha))
     idx = torch.randperm(x_vec.size(0), device=x_vec.device)
     x_mix = lam * x_vec + (1.0 - lam) * x_vec[idx]
     y_mix = lam * y_vec + (1.0 - lam) * y_vec[idx]
     return x_mix, y_mix
+
+
+def augment_lr_batch(
+    x_vec: torch.Tensor,
+    n_lr_e: int,
+    edge_dropout: float,
+    gaussian_noise_std: float,
+) -> torch.Tensor:
+    """Apply edge dropout and Gaussian noise to LR adjacency (first n_lr_e elements)."""
+    if edge_dropout <= 0.0 and gaussian_noise_std <= 0.0:
+        return x_vec
+    out = x_vec.clone()
+    adj = out[:, :n_lr_e]
+    if edge_dropout > 0.0:
+        mask = torch.rand_like(adj, device=adj.device) > edge_dropout
+        adj = adj * mask
+    if gaussian_noise_std > 0.0:
+        noise = torch.randn_like(adj, device=adj.device) * gaussian_noise_std
+        adj = (adj + noise).clamp(min=0.0, max=1.0)
+    out[:, :n_lr_e] = adj
+    return out
 
 
 def train_with_validation(
@@ -1009,8 +1189,13 @@ def train_with_validation(
         use_curriculum = edge_mask_t is not None and epoch <= cfg.curriculum_phase_epochs
         train_losses_epoch = []
         for x_vec, y_vec in tr_loader:
-            # Graph Mixup augmentation (50% probability when alpha > 0)
-            x_vec, y_vec = mixup_batch(x_vec, y_vec, cfg.mixup_alpha)
+            # Graph Mixup augmentation
+            x_vec, y_vec = mixup_batch(x_vec, y_vec, cfg.mixup_alpha, cfg.mixup_prob)
+            # Edge dropout + Gaussian noise on LR adjacency
+            x_vec = augment_lr_batch(
+                x_vec, n_lr_e,
+                cfg.edge_dropout, cfg.gaussian_noise_std,
+            )
             if cfg.lap_pe_dim > 0:
                 adj_vec = x_vec[:, :n_lr_e]
                 pe_vec  = x_vec[:, n_lr_e:].reshape(x_vec.size(0), cfg.n_lr, cfg.lap_pe_dim)
@@ -1033,6 +1218,12 @@ def train_with_validation(
                         (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
                 else:
                     loss = base_loss_fn(pred, y_vec)
+            if cfg.spectral_alignment_weight > 0:
+                l_spec = spectral_alignment_loss(
+                    pred, y_vec, cfg.n_hr, cfg.spectral_alignment_k,
+                    vectorizer, device,
+                )
+                loss = loss + cfg.spectral_alignment_weight * l_spec
             train_losses_epoch.append(loss.item())
 
             optimizer.zero_grad(set_to_none=True)
@@ -1058,6 +1249,12 @@ def train_with_validation(
                         (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
                 else:
                     val_loss = base_loss_fn(pred, y_vec)
+                if cfg.spectral_alignment_weight > 0:
+                    l_spec = spectral_alignment_loss(
+                        pred, y_vec, cfg.n_hr, cfg.spectral_alignment_k,
+                        vectorizer, device,
+                    )
+                    val_loss = val_loss + cfg.spectral_alignment_weight * l_spec
                 val_losses.append(val_loss.item())
 
         val_loss = float(np.mean(val_losses))
@@ -1166,9 +1363,14 @@ def train_full(
         use_curriculum = edge_mask_t is not None and epoch <= cfg.curriculum_phase_epochs
         train_losses = []
         for x_vec, y_vec in tr_loader:
-            # Graph Mixup augmentation (50% probability when alpha > 0)
-            x_vec, y_vec = mixup_batch(x_vec, y_vec, cfg.mixup_alpha)
+            # Graph Mixup augmentation
+            x_vec, y_vec = mixup_batch(x_vec, y_vec, cfg.mixup_alpha, cfg.mixup_prob)
+            # Edge dropout + Gaussian noise on LR adjacency
             n_lr_e_full = cfg.n_lr * (cfg.n_lr - 1) // 2
+            x_vec = augment_lr_batch(
+                x_vec, n_lr_e_full,
+                cfg.edge_dropout, cfg.gaussian_noise_std,
+            )
             if cfg.lap_pe_dim > 0:
                 adj_vec = x_vec[:, :n_lr_e_full]
                 pe_vec  = x_vec[:, n_lr_e_full:].reshape(x_vec.size(0), cfg.n_lr, cfg.lap_pe_dim)
@@ -1190,6 +1392,12 @@ def train_full(
                         (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
                 else:
                     loss = base_loss_fn(pred, y_vec)
+            if cfg.spectral_alignment_weight > 0:
+                l_spec = spectral_alignment_loss(
+                    pred, y_vec, cfg.n_hr, cfg.spectral_alignment_k,
+                    vectorizer, device,
+                )
+                loss = loss + cfg.spectral_alignment_weight * l_spec
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_clip()
@@ -1218,6 +1426,12 @@ def train_full(
                         v = cfg.l1_weight * nn.functional.l1_loss(pred, y_vec) + (1.0 - cfg.l1_weight) * nn.functional.mse_loss(pred, y_vec)
                     else:
                         v = base_loss_fn(pred, y_vec)
+                    if cfg.spectral_alignment_weight > 0:
+                        l_spec = spectral_alignment_loss(
+                            pred, y_vec, cfg.n_hr, cfg.spectral_alignment_k,
+                            vectorizer, device,
+                        )
+                        v = v + cfg.spectral_alignment_weight * l_spec
                     val_losses.append(v.item())
             val_loss = float(np.mean(val_losses))
             if val_loss < best_val:
@@ -1254,7 +1468,7 @@ def predict_vectors(
 ) -> np.ndarray:
     """Run inference for all subjects. If y_mean is given, add it back (residual mode).
 
-    When lap_pe_dim > 0, x_np is expected to be (N, n_lr_e + n_lr*lap_pe_dim) — the
+    When lap_pe_dim > 0, x_np is expected to be (N, n_lr_e + n_lr*lap_pe_dim) - the
     adjacency vector concatenated with the flattened Laplacian PE.
     """
     n_lr_e = n_lr * (n_lr - 1) // 2
@@ -1324,6 +1538,12 @@ def run_cv(args: argparse.Namespace) -> None:
         lr_min=getattr(args, "lr_min", 1e-6),
         curriculum_phase_epochs=getattr(args, "curriculum_phase_epochs", 0),
         curriculum_heavy_percentile=getattr(args, "curriculum_heavy_percentile", 50.0),
+        spectral_alignment_weight=getattr(args, "spectral_alignment_weight", 0.0),
+        spectral_alignment_k=getattr(args, "spectral_alignment_k", 5),
+        use_edge_bias=getattr(args, "use_edge_bias", False) and not getattr(args, "no_edge_bias", False),
+        edge_dropout=getattr(args, "edge_dropout", 0.0),
+        gaussian_noise_std=getattr(args, "gaussian_noise_std", 0.0),
+        mixup_prob=getattr(args, "mixup_prob", 0.5),
     )
 
     seed_everything(cfg.seed)
@@ -1332,12 +1552,16 @@ def run_cv(args: argparse.Namespace) -> None:
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    x_train, y_train, _ = load_data(Path(args.data_dir))
+    x_train, y_train, x_test = load_data(Path(args.data_dir))
     assert x_train.shape[0] == y_train.shape[0], "Mismatched train sample count."
 
     print(f"Device: {device}")
     print(f"Train LR: {x_train.shape} | Train HR: {y_train.shape}")
     print(f"Config: {asdict(cfg)}")
+    if cfg.spectral_alignment_weight > 0:
+        print(f"  Spectral alignment: weight={cfg.spectral_alignment_weight}, k={cfg.spectral_alignment_k}")
+    if cfg.edge_dropout > 0 or cfg.gaussian_noise_std > 0:
+        print(f"  Augmentation: edge_dropout={cfg.edge_dropout}, gaussian_noise_std={cfg.gaussian_noise_std}, mixup_prob={cfg.mixup_prob}")
 
     # --- Per-subject scale normalisation ---
     subj_scales_lr: np.ndarray | None = None
@@ -1405,7 +1629,7 @@ def run_cv(args: argparse.Namespace) -> None:
             metric_cache.unlink()
 
         fold_t0 = time.perf_counter()
-        # Compute per-fold HR mean for residual learning (training split only — no leakage)
+        # Compute per-fold HR mean for residual learning (training split only - no leakage)
         y_mean_fold = y_train[tr_idx].mean(axis=0) if cfg.use_residual else None
         model, best_val, best_epoch = train_with_validation(
             cfg,
@@ -1490,6 +1714,22 @@ def run_cv(args: argparse.Namespace) -> None:
             "completed_folds": sorted(r["fold"] for r in fold_records),
         })
 
+        # Save predictions_fold_{fold_num}.csv (Spec 3.1.1) - test predictions from this fold's model
+        x_test_in = x_test
+        if cfg.lap_pe_dim > 0:
+            lap_pe_test = compute_lap_pe(x_test, cfg.n_lr, cfg.lap_pe_dim, vectorizer)
+            x_test_in = np.concatenate([x_test, lap_pe_test], axis=1)
+        test_pred = predict_vectors(
+            model, x_test_in, device, vectorizer, cfg.batch_size, cfg.n_lr,
+            y_mean=y_mean_fold, lap_pe_dim=cfg.lap_pe_dim,
+        )
+        test_pred = np.clip(test_pred, a_min=0.0, a_max=None)
+        pred_path = out_dir / f"predictions_fold_{fold_id}.csv"
+        n_subj, n_feat = test_pred.shape
+        ids = np.arange(1, n_subj * n_feat + 1)
+        pd.DataFrame({"ID": ids, "Predicted": test_pred.flatten()}).to_csv(pred_path, index=False)
+        print(f"  Saved {pred_path}")
+
     total_seconds = float(time.perf_counter() - cv_start)
     mean_metrics, std_metrics = summarize_folds(fold_metric_dicts)
 
@@ -1514,6 +1754,15 @@ def run_cv(args: argparse.Namespace) -> None:
 
     write_json(out_dir / "cv_summary.json", cv_summary)
     write_json(out_dir / "resource_summary.json", resource_summary)
+
+    # Ensemble of 3 folds -> submission.csv (Spec 3.1)
+    pred_files = [out_dir / f"predictions_fold_{i}.csv" for i in (1, 2, 3)]
+    if all(p.exists() for p in pred_files):
+        dfs = [pd.read_csv(p) for p in pred_files]
+        ensemble = np.clip(np.mean([d["Predicted"].values for d in dfs], axis=0), 0.0, None)
+        sub_path = out_dir / "submission.csv"
+        pd.DataFrame({"ID": dfs[0]["ID"], "Predicted": ensemble}).to_csv(sub_path, index=False)
+        print(f"Saved: {sub_path} (ensemble of 3 folds)")
 
     print("\n" + "=" * 60)
     print("CV completed.")
@@ -1562,6 +1811,12 @@ def run_full(args: argparse.Namespace) -> None:
         lr_min=getattr(args, "lr_min", 1e-6),
         curriculum_phase_epochs=getattr(args, "curriculum_phase_epochs", 0),
         curriculum_heavy_percentile=getattr(args, "curriculum_heavy_percentile", 50.0),
+        spectral_alignment_weight=getattr(args, "spectral_alignment_weight", 0.0),
+        spectral_alignment_k=getattr(args, "spectral_alignment_k", 5),
+        use_edge_bias=getattr(args, "use_edge_bias", False) and not getattr(args, "no_edge_bias", False),
+        edge_dropout=getattr(args, "edge_dropout", 0.0),
+        gaussian_noise_std=getattr(args, "gaussian_noise_std", 0.0),
+        mixup_prob=getattr(args, "mixup_prob", 0.5),
     )
 
     device = get_device(args.device)
@@ -1632,6 +1887,8 @@ def run_full(args: argparse.Namespace) -> None:
         y_mean_full = y_tr.mean(axis=0) if cfg.use_residual else None
         if y_mean_full is not None and i == 0:
             print(f"  Residual mode: subtracting per-edge HR mean (mean={y_mean_full.mean():.4f})")
+        if (cfg.edge_dropout > 0 or cfg.gaussian_noise_std > 0) and i == 0:
+            print(f"  Augmentation: edge_dropout={cfg.edge_dropout}, gaussian_noise_std={cfg.gaussian_noise_std}, mixup_prob={cfg.mixup_prob}")
 
         fold_train_start = time.perf_counter()
         full_model = train_full(
@@ -1745,7 +2002,7 @@ def run_tune(args: argparse.Namespace) -> None:
         raise ImportError("Optuna is required for tune mode. Install with: pip install optuna")
 
     args = apply_preset(args)
-    tune_v3r = args.preset == "v3r" or (args.model == "dense_gcn" and args.preset in ("v3r", "v3"))
+    tune_v3r = args.preset in ("v3r", "v3r_eb", "v3r_eb_ffnn", "v3r_eb_ffnn_aug", "v3r_eb_ffnn_spec") or (args.model == "dense_gcn" and args.preset in ("v3r", "v3r_eb", "v3r_eb_ffnn", "v3r_eb_ffnn_aug", "v3r_eb_ffnn_spec", "v3"))
     if not tune_v3r and args.model != "dense_gat":
         print("Tune mode: use --preset v3r for DenseGCN or --preset v4 for DenseGAT.")
         args.model = "dense_gat"
@@ -1841,6 +2098,7 @@ def run_tune(args: argparse.Namespace) -> None:
             edge_scale=0.2,
             lap_pe_dim=0,
             pearl_pe_dim=0,
+            use_edge_bias=True,
         )
         fold_vals = []
         for fold_id, (tr_idx, va_idx) in enumerate(kf.split(x_train), start=1):
@@ -1955,6 +2213,7 @@ def run_tune(args: argparse.Namespace) -> None:
                 edge_scale=0.2,
                 lap_pe_dim=0,
                 pearl_pe_dim=0,
+                use_edge_bias=True,
             )
         else:
             cfg = TrainConfig(

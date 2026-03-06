@@ -8,7 +8,7 @@ Adapted from DGL Tutorial 2:
 SGC removes all nonlinearities between GCN layers, collapsing K layers of
 message passing into a single pre-computable matrix power:
 
-    H = S^K X          (no learnable weights — just neighbourhood averaging)
+    H = S^K X          (no learnable weights - just neighbourhood averaging)
     Y = H Theta         (single linear transformation)
 
 where S = D^{-1/2} (A + I) D^{-1/2}.
@@ -80,7 +80,7 @@ class SGCBaseline(nn.Module):
         """
         S = self._normalise(A_lr)
 
-        # K-hop propagation — no learnable weights
+        # K-hop propagation - no learnable weights
         H = X_lr
         for _ in range(self.K):
             H = S @ H                              # (B, n_lr, feat_dim)

@@ -13,7 +13,8 @@ This module also computes several secondary metrics:
         * Eigenvector Centrality (EC)
         * Betweenness Centrality (BC)
     Additional geometric/topological measures (spec §II.A.a):
-        * Node Strength (weighted degree)
+        * Node Strength (weighted degree) — reported as MAE(Strength) / mean(Strength)
+          so it is on a comparable scale (~0–1) for plotting with other metrics
         * Weighted Clustering Coefficient
 
 Notes:
@@ -342,15 +343,17 @@ def evaluate_fold(
 
         pred_strength = dict(Gp.degree(weight="weight"))
         gt_strength = dict(Gg.degree(weight="weight"))
+        mean_strength_gt = float(np.mean(list(gt_strength.values()))) if gt_strength else 1.0
 
         pred_clust = nx.clustering(Gp, weight="weight")
         gt_clust = nx.clustering(Gg, weight="weight")
 
+        mae_strength_raw = float(_avg_node_mae(pred_strength, gt_strength))
         cached_samples.append({
             "MAE (PC)": float(_avg_node_mae(pred_pc, gt_pc)),
             "MAE (EC)": float(_avg_node_mae(pred_ec, gt_ec)),
             "MAE (BC)": float(_avg_node_mae(pred_bc, gt_bc)),
-            "MAE (Strength)": float(_avg_node_mae(pred_strength, gt_strength)),
+            "MAE (Strength)": mae_strength_raw / max(mean_strength_gt, 1e-12),  # Normalised for plotting
             "MAE (Clustering)": float(_avg_node_mae(pred_clust, gt_clust)),
         })
 

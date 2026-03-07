@@ -17,11 +17,11 @@ However, the problem is challenging for several reasons. First, the mapping from
 
 ## NeuroRes-GNN: Methodology
 
-**NeuroRes-GNN** uses the **v3r_eb_ffnn_aug_light** configuration as the best-performing model to date (v3r_eb_ffnn + lighter augmentation: 5% edge dropout, 0.01 Gaussian noise, 60% mixup prob).
+**NeuroRes-GNN** uses `v3r_eb_ffnn_aug_light` as the best model. In this preset name, `v3r` is the residual-learning DenseGCN baseline, `eb` adds a learnable per-edge decoder bias, `ffnn` adds feed-forward sublayers inside each GCN block, and `aug_light` denotes lighter augmentation (5% edge dropout, 0.01 Gaussian noise, 60% mixup probability). The submission variant applies 3% inference shrinkage toward the training mean.
 
-**Latest submission:** Kaggle MAE **0.127182** (Big Dawgs, rank 7).
+**Latest submission:** Kaggle Public MAE **0.127094** (Big Dawgs, `v3r_eb_ffnn_aug_light_shrink03`).
 
-### Architecture (v3r_eb_ffnn_aug_light)
+### Architecture (`v3r_eb_ffnn_aug_light`)
 
 The model maps a low-resolution (LR) brain graph (160 nodes) to a high-resolution (HR) graph (268 nodes). All operations are dense tensor matmuls - no sparse graph library required.
 
@@ -55,7 +55,7 @@ What is kept in this repo and why:
 
 | Path | Purpose |
 |------|---------|
-| `notebooks/main.ipynb` | **Spec deliverable** - 3-fold CV, bar plots, `predictions_fold_{1,2,3}.csv`, `submission.csv`. Run this for the full pipeline. |
+| `notebooks/main.ipynb` | 3-fold CV, bar plots, `predictions_fold_{1,2,3}.csv`, `submission.csv`. Run this for the full pipeline. |
 | `src/train_dense_gcn.py` | Main training script - 3-fold CV, full retrain, presets (v3r_eb_ffnn_aug_light, etc.). Invoked by `main.ipynb` for the best config. |
 | `models/` | Model definitions - DenseGCN, SGC baseline, VGAE baseline, Bi-SR, GIN, GAT, etc. |
 | `utils/` | Shared utilities - `matrix_vectorizer`, `metrics` (8 measures), `plotting` (bar charts). |
@@ -75,19 +75,24 @@ Libraries: **torch**, **dgl**, **numpy**, **scipy**, **pandas**, **scikit-learn*
 
 <!-- TODO: Insert bar plots. Run `notebooks/main.ipynb` to generate bar plots and compare NeuroRes-GNN (v3r_eb_ffnn_aug_light) with SGC and VGAE baselines. -->
 
-**Reproduce best submission (v3r_eb_ffnn_aug_light):**
+**Reproduce best submission (v3r_eb_ffnn_aug_light_shrink03):**
 
 ```bash
 # Full pipeline (spec deliverable): run notebooks/main.ipynb for 3-fold CV, bar plots, submission.csv
 
 # Or run training directly for a Kaggle submission
-.venv/bin/python -m src.train_dense_gcn full --preset v3r_eb_ffnn_aug_light --max-epochs 600 --submission-path submission/v3r_eb_ffnn_aug_light_submission.csv
+.venv/bin/python -m src.train_dense_gcn full --preset v3r_eb_ffnn_aug_light --max-epochs 600 --val-ratio 0.15 --patience 60 --shrinkage-eps 0.03 --submission-path submission/v3r_eb_ffnn_aug_light_shrink03.csv
 ```
 
 ## References
 
-- Wu et al., "Simplifying Graph Convolutional Networks", ICML 2019 (SGC baseline)
-- Kipf & Welling, "Variational Graph Auto-Encoders", NeurIPS 2016 Workshop (VGAE baseline)
+- Wu et al., "Simplifying Graph Convolutional Networks," *ICML*, 2019.Refactor notebooks and utilities; update README and add submission ensembling
+
+- Isallari and Rekik, "Brain graph super-resolution using adversarial graph neural network with application to functional brain connectivity," *Medical Image Analysis*, 2021.
+- Mhiri, Ben Khalifa, Mahjoub, and Rekik, "Brain graph super-resolution for boosting neurological disorder diagnosis using unsupervised multi-topology connectional brain template learning," *Medical Image Analysis*, 2020.
+- Gao and Ji, "Graph U-Nets," *ICML*, 2019.
+- Kipf and Welling, "Variational Graph Auto-Encoders," *NeurIPS Workshop*, 2016.
+- Velickovic et al., "Graph Attention Networks," *ICLR*, 2018.
+- Han, Jiang, Liu, and Hu, "G-Mixup: Graph Data Augmentation for Graph Classification," *ICML*, 2022.
 - DGL Tutorial 2: https://github.com/basiralab/DGL/tree/main/Tutorials/Tutorial-2
 - basiralab/DGL Project: https://github.com/basiralab/DGL/blob/main/Project/
-- *(Add brain graph super-resolution papers used for the best model.)*

@@ -31,6 +31,7 @@ import torch.nn as nn
 from sklearn.model_selection import KFold, train_test_split
 from torch.utils.data import DataLoader, TensorDataset
 
+import reproducibility
 from models.dense_bisr import DenseBiSRGenerator
 from models.dense_gin import DenseGINGenerator
 from models.dense_gcn import DenseGCNGenerator
@@ -83,7 +84,7 @@ class TrainConfig:
     loss_name: str = "mse"
     huber_beta: float = 1.0
     l1_weight: float = 0.7
-    seed: int = 42
+    seed: int = reproducibility.random_seed
     num_folds: int = 3
     # GAT-specific (ignored for dense_gcn)
     num_heads: int = 4
@@ -247,11 +248,14 @@ def get_device(device_arg: str) -> torch.device:
 
 
 def seed_everything(seed: int) -> None:
+    """Mirror the challenge reproducibility settings for script entrypoints as well."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def load_csv(path: Path) -> np.ndarray:

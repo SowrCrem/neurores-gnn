@@ -25,6 +25,8 @@ if torch.cuda.is_available():
     # Additional settings for ensuring reproducibility on CUDA
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    # Print GPU information for verification
+    print(f"Using GPU: {torch.cuda.get_device_name(0)}")
 else:
     device = torch.device("cpu")
     print("CUDA not available. Using CPU.")

@@ -17,9 +17,9 @@ However, the problem is challenging for several reasons. First, the mapping from
 
 ## NeuroRes-GNN: Methodology
 
-**NeuroRes-GNN** uses `v3r_eb_ffnn_aug_light` as the best model. In this preset name, `v3r` is the residual-learning DenseGCN baseline, `eb` adds a learnable per-edge decoder bias, `ffnn` adds feed-forward sublayers inside each GCN block, and `aug_light` denotes lighter augmentation (5% edge dropout, 0.01 Gaussian noise, 60% mixup probability). The submission variant applies 3% inference shrinkage toward the training mean.
+**NeuroRes-GNN** uses `v3r_eb_ffnn_aug_light` as the best-performing model in this repository. In this preset name, `v3r` is the residual-learning DenseGCN baseline, `eb` adds a learnable per-edge decoder bias, `ffnn` adds feed-forward sublayers inside each GCN block, and `aug_light` denotes lighter augmentation (5% edge dropout, 0.01 Gaussian noise, 60% mixup probability). The mixup component is a sample-wise mixup-style interpolation on vectorized graph inputs and targets, rather than the graphon-based G-Mixup method of Han et al. (2022). The submission variant applies 3% inference shrinkage toward the training mean.
 
-**Latest submission:** Kaggle Public MAE **0.127094** (Big Dawgs, `v3r_eb_ffnn_aug_light_shrink03`).
+**Leaderboard result:** Our public-best submission (`v3r_eb_ffnn_aug_light_shrink03`) achieved a Kaggle public MAE of 0.127094, which initially placed the team 6th out of 24 on the public leaderboard. Our best private-leaderboard submission was `v3r_eb_ffnn_aug_light_learnshrink`, which finished 4th place with a final MAE of 0.148109, within 0.74% of the first-place score (0.147022).
 
 ### Architecture (`v3r_eb_ffnn_aug_light`)
 
@@ -41,13 +41,11 @@ The model maps a low-resolution (LR) brain graph (160 nodes) to a high-resolutio
 |-----------|---------|
 | **Residual learning** | Targets are centred: `y_target = y_hr - y_mean` (per-edge mean over training set). The model predicts deviations; at inference, `pred_final = pred + y_mean`. |
 | **Loss** | L1 (MAE-aligned). |
-| **Regularisation** | Graph Mixup (α=0.2, prob=0.6) on LR adjacency and HR targets; 5% edge dropout, Gaussian noise std=0.01; dropout 0.35. |
+| **Regularisation** | Mixup-style augmentation (α=0.2, prob=0.6) via direct convex interpolation of vectorized LR graphs and HR targets; 5% edge dropout, Gaussian noise std=0.01; dropout 0.35. |
 | **Optimiser** | AdamW, lr=8e-4, patience=60. |
 | **Evaluation** | 3-fold cross-validation, inductively. Eight measures: MAE, PCC, JSD, and average MAE of PageRank, Eigenvector, Betweenness centralities, node strength, and clustering coefficient. |
 
 Final predictions are clamped to `[0, ∞)` before submission.
-
-*(Figure to be added later.)*
 
 ## Repository Structure
 
@@ -73,7 +71,15 @@ Libraries: **torch**, **dgl**, **numpy**, **scipy**, **pandas**, **scikit-learn*
 
 ## Results
 
-<!-- TODO: Insert bar plots. Run `notebooks/main.ipynb` to generate bar plots and compare NeuroRes-GNN (v3r_eb_ffnn_aug_light) with SGC and VGAE baselines. -->
+`notebooks/main.ipynb` is the submission notebook. In one run, it:
+
+- loads `lr_train.csv`, `hr_train.csv`, and `lr_test.csv`
+- runs 3-fold cross-validation with `shuffle=True` and the anchored `random_seed`
+- writes `predictions_fold_1.csv`, `predictions_fold_2.csv`, `predictions_fold_3.csv`, and `submission.csv`
+- generates grouped bar plots for all 8 evaluation measures
+- optionally compares NeuroRes-GNN against the SGC and VGAE baselines
+
+For the repository submission, the latest generated spec outputs are tracked under `submission/`.
 
 **Reproduce best submission (v3r_eb_ffnn_aug_light_shrink03):**
 
@@ -86,13 +92,12 @@ Libraries: **torch**, **dgl**, **numpy**, **scipy**, **pandas**, **scikit-learn*
 
 ## References
 
-- Wu et al., "Simplifying Graph Convolutional Networks," *ICML*, 2019.Refactor notebooks and utilities; update README and add submission ensembling
-
+- Wu et al., "Simplifying Graph Convolutional Networks," *ICML*, 2019.
 - Isallari and Rekik, "Brain graph super-resolution using adversarial graph neural network with application to functional brain connectivity," *Medical Image Analysis*, 2021.
 - Mhiri, Ben Khalifa, Mahjoub, and Rekik, "Brain graph super-resolution for boosting neurological disorder diagnosis using unsupervised multi-topology connectional brain template learning," *Medical Image Analysis*, 2020.
 - Gao and Ji, "Graph U-Nets," *ICML*, 2019.
 - Kipf and Welling, "Variational Graph Auto-Encoders," *NeurIPS Workshop*, 2016.
 - Velickovic et al., "Graph Attention Networks," *ICLR*, 2018.
-- Han, Jiang, Liu, and Hu, "G-Mixup: Graph Data Augmentation for Graph Classification," *ICML*, 2022.
+- Han, Jiang, Liu, and Hu, "G-Mixup: Graph Data Augmentation for Graph Classification," *ICML*, 2022. This paper informed our discussion of graph-data augmentation, but our implementation uses a simpler sample-wise mixup-style interpolation rather than graphon-based G-Mixup.
 - DGL Tutorial 2: https://github.com/basiralab/DGL/tree/main/Tutorials/Tutorial-2
 - basiralab/DGL Project: https://github.com/basiralab/DGL/blob/main/Project/

@@ -1,10 +1,14 @@
 # Data and outputs
 data/
 submission/
+submission/*
 checkpoints/
 artifacts/
 *.zip
 submission.csv
+!submission/
+!submission/predictions_fold_*.csv
+!submission/submission.csv
 
 # Internal docs (planning, research, analysis) - retain locally, not for public repo
 docs/

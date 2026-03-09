@@ -1,0 +1,44 @@
+{
+  "task": "vgae_3fold_cv",
+  "folds": [
+    {
+      "fold": 1,
+      "metrics": {
+        "MAE": 0.138138,
+        "PCC": 0.630649,
+        "JSD": 0.28749,
+        "MAE (PC)": 0.00056,
+        "MAE (EC)": 0.013705,
+        "MAE (BC)": 0.019164,
+        "MAE (Strength)": 0.25371,
+        "MAE (Clustering)": 0.05209
+      }
+    },
+    {
+      "fold": 2,
+      "metrics": {
+        "MAE": 0.147063,
+        "PCC": 0.599434,
+        "JSD": 0.297763,
+        "MAE (PC)": 0.000562,
+        "MAE (EC)": 0.014068,
+        "MAE (BC)": 0.019448,
+        "MAE (Strength)": 0.276241,
+        "MAE (Clustering)": 0.061784
+      }
+    },
+    {
+      "fold": 3,
+      "metrics": {
+        "MAE": 0.141462,
+        "PCC": 0.624241,
+        "JSD": 0.289282,
+        "MAE (PC)": 0.000556,
+        "MAE (EC)": 0.013228,
+        "MAE (BC)": 0.019432,
+        "MAE (Strength)": 0.251654,
+        "MAE (Clustering)": 0.053546
+      }
+    }
+  ]
+}

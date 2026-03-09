@@ -57,7 +57,7 @@ What is kept in this repo and why:
 | `src/train_dense_gcn.py` | Main training script - 3-fold CV, full retrain, presets (v3r_eb_ffnn_aug_light, etc.). Invoked by `main.ipynb` for the best config. |
 | `models/` | Model definitions - DenseGCN, SGC baseline, VGAE baseline, Bi-SR, GIN, GAT, etc. |
 | `utils/` | Shared utilities - `matrix_vectorizer`, `metrics` (8 measures), `plotting` (bar charts). |
-| `gcn-encoder-ca-decoder/` | Data helpers - `data_utils.py` (`vec_to_adj`, `lr_node_features`, `to_tensor`) used by `main.ipynb`. |
+| `src/data_utils.py` | Shared tensor helpers for vectorized graph inputs used by `notebooks/main.ipynb`. |
 | `reproducibility.py` | Reproducibility config (Spec Note 2) - seed, CUDA/cudnn settings. |
 | `requirements.txt` | Dependencies for reproducible runs. |
 

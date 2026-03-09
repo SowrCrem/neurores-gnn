@@ -13,8 +13,8 @@ message passing into a single pre-computable matrix power:
 
 where S = D^{-1/2} (A + I) D^{-1/2}.
 
-This model uses the same dense-tensor interface as gcn-encoder-ca-decoder
-so it can be trained with the same data pipeline.
+This model uses the same dense-tensor interface as the repo's shared
+vectorized-graph data pipeline.
 """
 
 import torch

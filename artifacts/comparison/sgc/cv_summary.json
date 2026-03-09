@@ -1,0 +1,44 @@
+{
+  "task": "sgc_3fold_cv",
+  "folds": [
+    {
+      "fold": 1,
+      "metrics": {
+        "MAE": 0.138189,
+        "PCC": 0.631691,
+        "JSD": 0.287501,
+        "MAE (PC)": 0.00056,
+        "MAE (EC)": 0.013706,
+        "MAE (BC)": 0.019355,
+        "MAE (Strength)": 0.254073,
+        "MAE (Clustering)": 0.052202
+      }
+    },
+    {
+      "fold": 2,
+      "metrics": {
+        "MAE": 0.147045,
+        "PCC": 0.600559,
+        "JSD": 0.297695,
+        "MAE (PC)": 0.000561,
+        "MAE (EC)": 0.014067,
+        "MAE (BC)": 0.019611,
+        "MAE (Strength)": 0.276183,
+        "MAE (Clustering)": 0.061886
+      }
+    },
+    {
+      "fold": 3,
+      "metrics": {
+        "MAE": 0.141758,
+        "PCC": 0.619805,
+        "JSD": 0.28966,
+        "MAE (PC)": 0.000557,
+        "MAE (EC)": 0.013238,
+        "MAE (BC)": 0.019474,
+        "MAE (Strength)": 0.251565,
+        "MAE (Clustering)": 0.068193
+      }
+    }
+  ]
+}

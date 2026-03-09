@@ -25,6 +25,8 @@ However, the problem is challenging for several reasons. First, the mapping from
 
 The model maps a low-resolution (LR) brain graph (160 nodes) to a high-resolution (HR) graph (268 nodes). All operations are dense tensor matmuls - no sparse graph library required.
 
+![NeuroRes-GNN architecture overview](assets/arch.jpeg)
+
 | Stage | Description |
 |-------|-------------|
 | **1. Node features** | Each LR node is represented by its adjacency row: `X_lr ∈ ℝ^{160×160}`. The full LR adjacency is used as input. |
@@ -80,6 +82,8 @@ Libraries: **torch**, **dgl**, **numpy**, **scipy**, **pandas**, **scikit-learn*
 - optionally compares NeuroRes-GNN against the SGC and VGAE baselines
 
 For the repository submission, the latest generated spec outputs are tracked under `submission/`.
+
+![3-fold evaluation metrics](assets/combined_eval_metrics.png)
 
 **Reproduce best submission (v3r_eb_ffnn_aug_light_shrink03):**
 
